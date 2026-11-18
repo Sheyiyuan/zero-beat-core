@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,7 +43,16 @@ func (s *Service) DownloadSong(ctx context.Context, song store.Song, quality sou
 		Duration:   merged.Duration,
 		Cover:      merged.Cover,
 	}
-	outPath := filepath.Join(download.DefaultDir(), download.Filename(t)+download.Ext(stream.Codec))
+	dir := s.downloadDir
+	if dir == "" {
+		dir = download.DefaultDir()
+	}
+	// Include identity to prevent unrelated songs with identical tags colliding.
+	stem := download.Filename(t)
+	if s.downloadDir != "" {
+		stem += " [" + download.Filename(source.Track{Title: string(t.Source) + "-" + t.ExternalID}) + "]"
+	}
+	outPath := filepath.Join(dir, stem+download.Ext(stream.Codec))
 	var onProgress func(download.Progress)
 	if progress != nil {
 		onProgress = func(p download.Progress) { progress(p.Done, p.Total) }
@@ -59,13 +67,10 @@ func (s *Service) DownloadSong(ctx context.Context, song store.Song, quality sou
 		if res.Path != "" {
 			path = res.Path
 		}
-		if errors.Is(err, download.ErrExists) && path != "" {
-			_ = s.RecordDownload(merged, path, res.Size, stream.Codec, duration)
-		}
 		return DownloadResult{Song: merged, Path: path, Size: res.Size, Err: err}
 	}
-	_ = s.RecordDownload(merged, res.Path, res.Size, stream.Codec, duration)
-	return DownloadResult{Song: merged, Path: res.Path, Size: res.Size}
+	err = s.RecordDownload(merged, res.Path, res.Size, stream.Codec, duration)
+	return DownloadResult{Song: merged, Path: res.Path, Size: res.Size, Err: err}
 }
 
 // RecordDownload 把成功落盘（或已存在）的文件登记到下载索引。

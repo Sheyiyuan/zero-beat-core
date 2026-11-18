@@ -250,7 +250,7 @@ func TestUpgradeMetaWritesV2Once(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.V != MetaVersion || MetaVersion != 2 {
+	if after.V != LibraryMetaVersion || LibraryMetaVersion != 2 {
 		t.Fatalf("升级后应为 v2: %d", after.V)
 	}
 	// 密钥参数不变，升级只是格式变更。

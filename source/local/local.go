@@ -17,6 +17,7 @@ import (
 
 	"github.com/sheyiyuan/zero-beat-core/library"
 	"github.com/sheyiyuan/zero-beat-core/lyrics"
+	"github.com/sheyiyuan/zero-beat-core/resource"
 	"github.com/sheyiyuan/zero-beat-core/source"
 	"github.com/sheyiyuan/zero-beat-core/store"
 )
@@ -157,6 +158,9 @@ func (s *Source) songPath(song store.Song) (string, error) {
 		return "", err
 	}
 	for _, f := range files {
+		if f.Present && resource.IsURI(f.Path) {
+			return f.Path, nil
+		}
 		info, err := os.Stat(f.Path)
 		if err != nil || info.IsDir() || info.Size() == 0 {
 			continue

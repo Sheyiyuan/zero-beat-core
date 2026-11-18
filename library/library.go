@@ -5,9 +5,11 @@
 package library
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -83,7 +85,8 @@ type Result struct {
 //
 // 只读当前层、不递归：子目录数量单独返回给界面提示。目录本身不可读时返回
 // error，调用方据此把歌单标记为缺失，而不是清空已有条目。
-func Scan(dir string) (Result, error) {
+func Scan(dir string) (Result, error) { return ScanContext(context.Background(), dir) }
+func ScanContext(ctx context.Context, dir string) (Result, error) {
 	dir = filepath.Clean(dir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -91,6 +94,9 @@ func Scan(dir string) (Result, error) {
 	}
 	out := Result{Dir: dir}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		name := entry.Name()
 		full := filepath.Join(dir, name)
 		if entry.IsDir() {
@@ -336,4 +342,28 @@ func EmbeddedLyrics(path string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// InspectHandle borrows an already-open Android ContentResolver descriptor.
+// Go computes tags and identity using the same pipeline as desktop scans.
+// The caller keeps the descriptor open until this function returns.
+func InspectHandle(fd int, name, uri string, duration int) (File, error) {
+	path := fmt.Sprintf("/proc/self/fd/%d", fd)
+	info, err := os.Stat(path)
+	if err != nil {
+		return File{}, err
+	}
+	file, warning := readFile(path, fs.FileInfoToDirEntry(info))
+	if warning != nil {
+		return File{}, fmt.Errorf("%s", warning.Reason)
+	}
+	if file.Title == filepath.Base(path) {
+		file.Title = strings.TrimSuffix(name, filepath.Ext(name))
+	}
+	if file.Duration == 0 {
+		file.Duration = duration
+	}
+	file.Path = uri
+	file.MetaKey = MetaKey(file)
+	return file, nil
 }

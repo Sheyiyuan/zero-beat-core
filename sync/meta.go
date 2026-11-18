@@ -62,14 +62,17 @@ func DecodeMeta(data []byte) (Meta, error) {
 	if m.V < MetaVersionMin || m.V > MetaVersion {
 		return Meta{}, fmt.Errorf("%w: meta.v=%d，请升级 zero-beat", ErrSchema, m.V)
 	}
+	if m.CreatedAt <= 0 {
+		return Meta{}, fmt.Errorf("%w: created_at 无效", ErrCorruptRepo)
+	}
+	if m.V >= 3 && m.KeyVersion == 0 && m.Salt == "" && m.Keycheck == "" && m.KDF == (KDFParams{}) {
+		return m, nil
+	}
 	if m.KeyVersion < 1 {
 		return Meta{}, fmt.Errorf("%w: key_version 无效", ErrCorruptRepo)
 	}
 	if err := m.KDF.Validate(); err != nil {
 		return Meta{}, err
-	}
-	if m.CreatedAt <= 0 {
-		return Meta{}, fmt.Errorf("%w: created_at 无效", ErrCorruptRepo)
 	}
 	salt, err := base64.StdEncoding.DecodeString(m.Salt)
 	if err != nil || len(salt) != SaltSize {
@@ -105,6 +108,9 @@ func (m Meta) KeycheckBytes() ([]byte, error) {
 
 // Unlock 用口令派生密钥并校验 keycheck；失败返回 ErrKeyMismatch。
 func (m Meta) Unlock(passphrase string) (*KeyState, error) {
+	if m.KeyVersion == 0 {
+		return nil, ErrKeyMissing
+	}
 	salt, err := m.SaltBytes()
 	if err != nil {
 		return nil, err

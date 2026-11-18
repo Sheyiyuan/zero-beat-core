@@ -335,10 +335,17 @@ func (c *Client) validateTree(ctx context.Context, g *Git, rev string, key *KeyS
 	if err != nil {
 		return err
 	}
+	if len(tree) == 0 {
+		return nil
+	}
+	meta, err := DecodeMeta(tree[MetaFile])
+	if err != nil {
+		return err
+	}
 	for p, data := range tree {
 		switch {
 		case p == MetaFile:
-			_, err = DecodeMeta(data)
+			continue // 元数据已在检查账户文件前校验。
 		case strings.HasPrefix(p, PlaylistsDir+"/"):
 			_, err = DecodePlaylistFile(data)
 		case strings.HasPrefix(p, AnnotationsDir+"/"):
@@ -347,6 +354,9 @@ func (c *Client) validateTree(ctx context.Context, g *Git, rev string, key *KeyS
 		case p == KeymapFile:
 			err = validateKeymapBytes(data)
 		case accountSourceFromPath(p) != "":
+			if meta.KeyVersion == 0 {
+				return fmt.Errorf("%w: 未启用加密的仓库包含登录态文件", ErrCorruptRepo)
+			}
 			var envelope Envelope
 			err = decodeJSONStrict(data, &envelope)
 			if err == nil && envelope.V != EnvelopeVersion {

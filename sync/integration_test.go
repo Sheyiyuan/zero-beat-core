@@ -53,7 +53,11 @@ func newTestDevice(t *testing.T, name string) *testDevice {
 		TokenPath:  filepath.Join(dir, "sync-token"),
 		KeymapPath: filepath.Join(dir, "keymap.toml"),
 	}
-	return &testDevice{name: name, dir: dir, store: st, client: NewClient(opts)}
+	client := NewClient(opts)
+	if err := client.SetSyncAccounts(true); err != nil {
+		t.Fatal(err)
+	}
+	return &testDevice{name: name, dir: dir, store: st, client: client}
 }
 
 func setupBareRemote(t *testing.T) string {

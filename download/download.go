@@ -2,14 +2,13 @@
 package download
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -51,8 +50,9 @@ func Ext(codec string) string {
 		return ".flac"
 	case strings.Contains(c, "mp3"):
 		return ".mp3"
-	case strings.Contains(c, "aac"), strings.Contains(c, "mp4a"),
-		strings.Contains(c, "ec-3"), strings.Contains(c, "opus"):
+	case strings.Contains(c, "opus"):
+		return ".opus"
+	case strings.Contains(c, "aac"), strings.Contains(c, "mp4a"), strings.Contains(c, "ec-3"):
 		return ".m4a"
 	}
 	return ".m4a"
@@ -77,11 +77,14 @@ func Filename(track source.Track) string {
 // PartPath 返回稳定续传文件名；带来源和曲目 ID，避免不同曲目混用半成品。
 func PartPath(outPath string, track source.Track) string {
 	tag := safeFilename(string(track.Source) + "-" + track.ExternalID)
+	if track.Page > 1 {
+		tag += fmt.Sprintf("-p%d", track.Page)
+	}
 	return outPath + "." + tag + ".part"
 }
 
 // Run 下载一首歌到 outPath。
-// force 为 true 时会删除已有目标和 .part，从零开始；否则已有目标返回 ErrExists。
+// force 从零下载到新临时文件，验证成功后原子替换旧目标；否则已有目标返回 ErrExists。
 func Run(ctx context.Context, track source.Track, stream source.Stream, outPath string, force bool, onProgress func(Progress)) (Result, error) {
 	if outPath == "" {
 		return Result{}, errors.New("download: 输出路径为空")
@@ -98,19 +101,31 @@ func Run(ctx context.Context, track source.Track, stream source.Stream, outPath 
 
 	part := PartPath(outPath, track)
 	if force {
-		_ = os.Remove(outPath)
 		_ = os.Remove(part)
+		_ = os.Remove(part + ".resume.json")
 	}
 	resumed := false
 	if info, err := os.Stat(part); err == nil && info.Size() > 0 {
 		resumed = true
 	}
 
+	temp, err := os.CreateTemp(filepath.Dir(outPath), ".zero-remux-*"+filepath.Ext(outPath))
+	if err != nil {
+		return Result{}, err
+	}
+	staged := temp.Name()
+	if err = temp.Close(); err != nil {
+		return Result{}, err
+	}
+	defer os.Remove(staged)
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := downloadToPart(ctx, part, stream, onProgress); err != nil {
 			return Result{Path: outPath, Resumed: resumed}, err
 		}
-		if err := ffmpegRemux(ctx, part, outPath, track); err != nil {
+		if err := platformRemux(ctx, part, staged, track); err != nil {
+			if ctx.Err() != nil {
+				return Result{Path: outPath, Resumed: resumed}, ctx.Err()
+			}
 			if attempt == 0 {
 				_ = os.Remove(part)
 				resumed = false
@@ -118,7 +133,30 @@ func Run(ctx context.Context, track source.Track, stream source.Stream, outPath 
 			}
 			return Result{Path: outPath, Resumed: resumed}, err
 		}
+		if err = ctx.Err(); err != nil {
+			return Result{Path: outPath, Resumed: resumed}, err
+		}
+		fi, err := os.Stat(staged)
+		if err != nil || fi.Size() == 0 {
+			return Result{}, fmt.Errorf("封装输出为空或不可读")
+		}
+		file, err := os.OpenFile(staged, os.O_RDWR, 0)
+		if err != nil {
+			return Result{}, err
+		}
+		err = file.Sync()
+		closeErr := file.Close()
+		if err != nil {
+			return Result{}, err
+		}
+		if closeErr != nil {
+			return Result{}, closeErr
+		}
+		if err = os.Rename(staged, outPath); err != nil {
+			return Result{}, err
+		}
 		_ = os.Remove(part)
+		_ = os.Remove(part + ".resume.json")
 		size := int64(0)
 		if fi, err := os.Stat(outPath); err == nil {
 			size = fi.Size()
@@ -140,6 +178,16 @@ func downloadToPart(ctx context.Context, path string, stream source.Stream, onPr
 		return fmt.Errorf("读取临时文件: %w", err)
 	}
 	offset := info.Size()
+	var saved resumeIdentity
+	if raw, e := os.ReadFile(path + ".resume.json"); e == nil {
+		_ = json.Unmarshal(raw, &saved)
+	}
+	if offset > 0 && (saved.Validator == "" || saved.Total > 0 && offset > saved.Total) {
+		if err = f.Truncate(0); err != nil {
+			return err
+		}
+		offset = 0
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, stream.URL, nil)
 	if err != nil {
@@ -150,6 +198,7 @@ func downloadToPart(ctx context.Context, path string, stream source.Stream, onPr
 	}
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		req.Header.Set("If-Range", saved.Validator)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -161,6 +210,14 @@ func downloadToPart(ctx context.Context, path string, stream source.Stream, onPr
 	start := offset
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
+		if offset > 0 && responseValidator(resp) != saved.Validator {
+			_ = os.Remove(path + ".resume.json")
+			return fmt.Errorf("下载资源已变化，请重新下载")
+		}
+		var first, last, length int64
+		if n, _ := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &first, &last, &length); n != 3 || first != offset || last < first || length <= last {
+			return fmt.Errorf("下载续传范围无效")
+		}
 		if _, err := f.Seek(0, io.SeekEnd); err != nil {
 			return fmt.Errorf("定位临时文件: %w", err)
 		}
@@ -175,15 +232,23 @@ func downloadToPart(ctx context.Context, path string, stream source.Stream, onPr
 			start = 0
 		}
 	case http.StatusRequestedRangeNotSatisfiable:
-		if offset > 0 {
-			return nil // 本地已经完整，交给 ffmpeg 校验/封装
+		var length int64
+		if n, _ := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes */%d", &length); n == 1 && length == offset && offset > 0 && responseValidator(resp) == saved.Validator {
+			return nil // Complete identity verified; the remux stage validates the media.
 		}
-		return fmt.Errorf("下载失败: HTTP %s", resp.Status)
+		_ = os.Remove(path + ".resume.json")
+		return fmt.Errorf("下载范围无法确认，请重新下载")
 	default:
 		return fmt.Errorf("下载失败: HTTP %s", resp.Status)
 	}
 
 	total := contentTotal(resp, start)
+	identity, _ := json.Marshal(resumeIdentity{Validator: responseValidator(resp), Total: total})
+	// Without a strong validator the next attempt restarts instead of joining
+	// different resources, qualities or expiring CDN variants.
+	if err = os.WriteFile(path+".resume.json", identity, 0600); err != nil {
+		return err
+	}
 	report(onProgress, Progress{Done: start, Total: total})
 	pw := &progressCallback{onProgress: onProgress, done: start, total: total}
 	if _, err := io.CopyBuffer(io.MultiWriter(f, pw), resp.Body, make([]byte, 64*1024)); err != nil {
@@ -193,6 +258,22 @@ func downloadToPart(ctx context.Context, path string, stream source.Stream, onPr
 	return nil
 }
 
+type resumeIdentity struct {
+	Validator string `json:"validator"`
+	Total     int64  `json:"total"`
+}
+
+func responseValidator(resp *http.Response) string {
+	if tag := resp.Header.Get("ETag"); tag != "" && !strings.HasPrefix(tag, "W/") {
+		return tag
+	}
+	if value := resp.Header.Get("Last-Modified"); value != "" {
+		if _, err := http.ParseTime(value); err == nil {
+			return value
+		}
+	}
+	return ""
+}
 func report(onProgress func(Progress), p Progress) {
 	if onProgress != nil {
 		onProgress(p)
@@ -224,35 +305,6 @@ func contentTotal(resp *http.Response, start int64) int64 {
 		return start + resp.ContentLength
 	}
 	return 0
-}
-
-func ffmpegRemux(ctx context.Context, in, out string, track source.Track) error {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return fmt.Errorf("找不到 ffmpeg，无法封装音频: %w", err)
-	}
-	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", in}
-	for _, kv := range [][2]string{
-		{"title", track.Title},
-		{"artist", track.Artist},
-		{"album", track.Album},
-	} {
-		if v := strings.TrimSpace(kv[1]); v != "" {
-			args = append(args, "-metadata", kv[0]+"="+v)
-		}
-	}
-	args = append(args, "-vn", "-c", "copy", out)
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		_ = os.Remove(out)
-		msg := strings.TrimSpace(stderr.String())
-		if msg != "" {
-			return fmt.Errorf("封装音频失败: %w: %s", err, msg)
-		}
-		return fmt.Errorf("封装音频失败: %w", err)
-	}
-	return nil
 }
 
 func safeFilename(s string) string {

@@ -176,3 +176,48 @@ func TestManagerRecoversRunnerPanic(t *testing.T) {
 	}
 	mgr.Remove(id)
 }
+
+func TestCancelKeepsIdentityUntilRunnerHasReleasedFile(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	manager := New(2, func(ctx context.Context, _ store.Song, _ Job, _ func(int64, int64)) (string, int64, error) {
+		close(started)
+		<-ctx.Done()
+		<-release
+		return "", 0, ctx.Err()
+	})
+	id, _ := manager.Add(song("a"), "a", Job{})
+	manager.Start()
+	<-started
+	manager.Cancel(id)
+	if _, added := manager.Add(song("a"), "a", Job{}); added {
+		t.Fatal("same output reopened before cancelled writer exited")
+	}
+	manager.Remove(id)
+	if _, added := manager.Add(song("a"), "a", Job{}); added {
+		t.Fatal("removing a running task released its file identity")
+	}
+	close(release)
+	manager.Close()
+	if _, added := manager.Add(song("b"), "b", Job{}); added {
+		t.Fatal("closed manager accepted work")
+	}
+}
+func TestCloseDrainsWithoutEventConsumer(t *testing.T) {
+	manager := New(1, func(ctx context.Context, _ store.Song, _ Job, _ func(int64, int64)) (string, int64, error) {
+		<-ctx.Done()
+		return "", 0, ctx.Err()
+	})
+	for i := 0; i < cap(manager.events); i++ {
+		manager.events <- Event{}
+	}
+	manager.Add(song("a"), "a", Job{})
+	manager.Start()
+	done := make(chan struct{})
+	go func() { manager.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked on a terminal event without consumer")
+	}
+}

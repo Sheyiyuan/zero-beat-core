@@ -94,7 +94,7 @@ type SnapshotInput struct {
 // PlaylistPath 返回歌单在仓库里的相对路径；ID 已带 local-/mix- 前缀。
 func PlaylistPath(id string) string { return PlaylistsDir + "/" + id + ".json" }
 
-// AnnotationPath 返回单曲注释路径；歌曲 ID 做 URL 转义，避免冒号等字符影响文件名。
+// AnnotationPath 返回单曲注释路径；URL 路径转义会保留冒号，沿用 v1/v2 的文件名。
 func AnnotationPath(songID string) string {
 	return AnnotationsDir + "/" + url.PathEscape(songID) + ".json"
 }

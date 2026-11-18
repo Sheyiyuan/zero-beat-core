@@ -74,6 +74,7 @@ type Status struct {
 	Auth             string
 	AuthHint         string
 	Auto             bool
+	SyncAccounts     bool
 	KeyCached        bool
 	KeyMatchesRepo   bool
 	KeyVersion       int
@@ -98,13 +99,13 @@ func (s Status) Summary() string {
 		return "同步冲突"
 	case s.LastError != "":
 		return "同步失败：" + shortError(s.LastError)
-	case s.KeyIssue != "":
+	case s.SyncAccounts && s.KeyIssue != "":
 		return "同步 密钥不可用"
 	case s.LastSyncAt.IsZero():
 		return "同步未运行"
-	case !s.KeyCached:
+	case s.SyncAccounts && !s.KeyCached:
 		return "同步 密钥不可用"
-	case !s.KeyMatchesRepo:
+	case s.SyncAccounts && !s.KeyMatchesRepo:
 		return "同步 密钥属于另一个仓库"
 	default:
 		return "同步 " + s.LastSyncAt.Format("15:04") + " 成功"
@@ -145,4 +146,20 @@ func archivePath(dir string, now time.Time) string {
 		candidate = fmt.Sprintf("%s-%d", base, i)
 	}
 	return candidate
+}
+
+// 旧 state 的 credential_warnings 同时存了普通警告；关闭登录态同步时只隐藏
+// 登录态/密钥提示，保留 keymap、仓库升级等仍然需要用户关注的提示。
+func withoutAccountWarnings(warnings []string, keyIssue string) []string {
+	var kept []string
+	for _, warning := range warnings {
+		account := warning == keyIssue
+		for _, prefix := range []string{ErrKeyMissing.Error(), ErrKeyMismatch.Error(), "登录态", "远端登录态", "读取登录态", "更新本地登录态"} {
+			account = account || strings.HasPrefix(warning, prefix)
+		}
+		if !account {
+			kept = append(kept, warning)
+		}
+	}
+	return kept
 }

@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"path/filepath"
+	"github.com/sheyiyuan/zero-beat-core/resource"
+	"strings"
+
 	"time"
 )
 
@@ -98,7 +100,7 @@ func (s *Store) LibraryFile(playlistID, path string) (LibraryFile, error) {
 	var f LibraryFile
 	err := s.db.QueryRow(`
 SELECT playlist_id, path, song_id, size, mtime, content_hash, present
-FROM library_files WHERE playlist_id = ? AND path = ?`, playlistID, filepath.Clean(path)).
+FROM library_files WHERE playlist_id = ? AND path = ?`, playlistID, resource.Clean(path)).
 		Scan(&f.PlaylistID, &f.Path, &f.SongID, &f.Size, &f.ModTime, &f.ContentHash, &f.Present)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LibraryFile{}, ErrNotFound
@@ -176,6 +178,58 @@ func (s *Store) ReplaceLibraryItems(playlistID string, items []LibraryItem) erro
 		return fmt.Errorf("store: 开启事务: %w", err)
 	}
 	defer tx.Rollback()
+	if err := replaceLibraryItems(tx, playlistID, items); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CommitResourceScan atomically changes the root, index and device-only lyrics.
+// A failed scan never leaves a new empty playlist or a partially replaced root.
+func (s *Store) CommitResourceScan(id, root, title string, items []LibraryItem, texts map[string]string) (string, error) {
+	if !resource.IsURI(root) {
+		return "", fmt.Errorf("store: 目录授权无效")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	if id == "" {
+		id = fmt.Sprintf("%s%d", FolderPlaylistPrefix, time.Now().UnixNano())
+		if strings.TrimSpace(title) == "" {
+			title = "本地音乐"
+		}
+		_, err = tx.Exec(`INSERT INTO playlists (id, source, title, kind, remote_id, sync_excluded, root_path, created_at) VALUES (?, '', ?, 'folder', '', 1, ?, ?)`, id, title, root, time.Now().Unix())
+	} else {
+		var result sql.Result
+		result, err = tx.Exec(`UPDATE playlists SET root_path = ? WHERE id = ? AND kind = 'folder'`, root, id)
+		if err == nil {
+			n, e := result.RowsAffected()
+			err = e
+			if n != 1 && err == nil {
+				err = ErrNotFound
+			}
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	if err = replaceLibraryItems(tx, id, items); err != nil {
+		return "", err
+	}
+	for song, text := range texts {
+		if _, err = tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, "local.resource.lyrics:"+song, text); err != nil {
+			return "", err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func replaceLibraryItems(tx *sql.Tx, playlistID string, items []LibraryItem) error {
 	if _, err := tx.Exec(`UPDATE library_files SET present = 0 WHERE playlist_id = ?`, playlistID); err != nil {
 		return fmt.Errorf("store: 标记文件缺失: %w", err)
 	}
@@ -223,7 +277,7 @@ VALUES (?, ?, ?, ?, ?, ?, 1)
 ON CONFLICT(playlist_id, path) DO UPDATE SET
 	song_id = excluded.song_id, size = excluded.size, mtime = excluded.mtime,
 	content_hash = excluded.content_hash, present = 1`,
-			playlistID, filepath.Clean(item.Path), song.ID, item.Size, item.ModTime, item.ContentHash); err != nil {
+			playlistID, resource.Clean(item.Path), song.ID, item.Size, item.ModTime, item.ContentHash); err != nil {
 			return fmt.Errorf("store: 写入文件索引: %w", err)
 		}
 	}
@@ -232,7 +286,7 @@ UPDATE playlists SET scan_status = 'ok', scan_error = '', scanned_at = ? WHERE i
 		now.Unix(), playlistID); err != nil {
 		return fmt.Errorf("store: 更新扫描状态: %w", err)
 	}
-	return tx.Commit()
+	return nil
 }
 
 // UpdatePlaylistScan 只更新扫描状态，不动已物化的条目。
@@ -249,11 +303,11 @@ UPDATE playlists SET scan_status = ?, scan_error = ?, scanned_at = ? WHERE id = 
 
 // SetPlaylistRoot 更换文件夹歌单的根目录；已有条目保持不变，等下次扫描替换。
 func (s *Store) SetPlaylistRoot(playlistID, rootPath string) error {
-	if !filepath.IsAbs(rootPath) {
+	if !resource.Valid(rootPath) {
 		return fmt.Errorf("store: 文件夹路径必须是绝对路径")
 	}
 	_, err := s.db.Exec(`UPDATE playlists SET root_path = ?, scan_status = '', scan_error = '', scanned_at = 0
-WHERE id = ? AND kind = 'folder'`, filepath.Clean(rootPath), playlistID)
+WHERE id = ? AND kind = 'folder'`, resource.Clean(rootPath), playlistID)
 	if err != nil {
 		return fmt.Errorf("store: 更换文件夹: %w", err)
 	}
@@ -265,7 +319,7 @@ WHERE id = ? AND kind = 'folder'`, filepath.Clean(rootPath), playlistID)
 func (s *Store) DownloadByPath(path string) (Download, bool, error) {
 	row := s.db.QueryRow(`
 SELECT song_id, path, size, codec, duration_ms, created_at FROM downloads
-WHERE path = ? LIMIT 1`, filepath.Clean(path))
+WHERE path = ? LIMIT 1`, resource.Clean(path))
 	d, err := scanDownload(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Download{}, false, nil

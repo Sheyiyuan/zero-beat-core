@@ -17,16 +17,23 @@ func (c *Client) inputDigest() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	accounts, err := c.opts.Store.ListAccounts()
+	cfg, err := LoadConfig(c.opts.ConfigPath)
 	if err != nil {
 		return "", err
 	}
-	for _, a := range accounts {
-		payload, at, err := c.opts.Store.LoadAccountAt(a.Source)
+	snap.Files["sync_accounts"] = []byte(fmt.Sprint(cfg.SyncAccounts))
+	if cfg.SyncAccounts {
+		accounts, err := c.opts.Store.ListAccounts()
 		if err != nil {
 			return "", err
 		}
-		snap.Files["accounts/"+a.Source] = []byte(fmt.Sprintf("%d\n%s", at, payload))
+		for _, a := range accounts {
+			payload, at, err := c.opts.Store.LoadAccountAt(a.Source)
+			if err != nil {
+				return "", err
+			}
+			snap.Files["accounts/"+a.Source] = []byte(fmt.Sprintf("%d\n%s", at, payload))
+		}
 	}
 	// Include invalid/missing keymaps too: they must not invalidate a guard silently.
 	if c.opts.KeymapPath != "" {
@@ -69,7 +76,7 @@ func (c *Client) saveTransaction(tx transaction) error {
 // A merge whose import was not completed is replayed from its local parent.
 // The database is kept intact, so edits made during/after a crash are exported
 // on the next round rather than overwritten by a stale candidate tree.
-func (c *Client) recoverTransaction(ctx context.Context, g *Git) error {
+func (c *Client) recoverTransaction(ctx context.Context, g *Git, cfg Config) error {
 	path := filepath.Join(c.opts.Dir, "transaction.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -90,7 +97,7 @@ func (c *Client) recoverTransaction(ctx context.Context, g *Git) error {
 		if tx.Candidate == "" {
 			return ErrCorruptRepo
 		}
-		key, err := LoadKeyState(c.opts.KeyPath)
+		key, err := c.loadSyncKey(cfg)
 		if err != nil {
 			return err
 		}

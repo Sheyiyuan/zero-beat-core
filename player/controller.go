@@ -548,3 +548,12 @@ func (c *Controller) CurrentQuality() string {
 	}
 	return c.engine.CurrentStream().Quality
 }
+
+// SetSleep replaces the timer; zero cancels it. UI and CLI share Tick semantics.
+func (c *Controller) SetSleep(duration time.Duration) {
+	c.state.SleepSlot = 0
+	c.state.SleepUntil = time.Time{}
+	if duration > 0 {
+		c.state.SleepUntil = c.now().Add(duration)
+	}
+}

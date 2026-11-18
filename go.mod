@@ -7,6 +7,7 @@ require (
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/go-git/go-git/v5 v5.16.3
 	github.com/go-musicfox/netease-music v1.6.0
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/xanzy/ssh-agent v0.3.3
 	golang.org/x/crypto v0.53.0
 	golang.org/x/sys v0.48.0

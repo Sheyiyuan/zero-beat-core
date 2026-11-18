@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -63,12 +64,19 @@ func (s *Service) lrclibClient() *lrclib.Client {
 }
 
 // localLyricsConfig 读取 lyrics.toml；文件按 mtime+size 缓存，改配置后下一次读取生效。
-func localLyricsConfig() (lyrics.LocalConfig, []string) {
+func localLyricsConfig() (lyrics.LocalConfig, []string) { return localLyricsConfigAt("") }
+func localLyricsConfigAt(dir string) (lyrics.LocalConfig, []string) {
 	cachedCfg.mu.Lock()
 	defer cachedCfg.mu.Unlock()
-	path, err := config.LyricsPath()
-	if err != nil {
-		return lyrics.DefaultLocalConfig(), nil
+	var path string
+	if dir != "" {
+		path = filepath.Join(dir, "lyrics.toml")
+	} else {
+		var err error
+		path, err = config.LyricsPath()
+		if err != nil {
+			return lyrics.DefaultLocalConfig(), nil
+		}
 	}
 	var (
 		mod  time.Time
@@ -103,7 +111,7 @@ var cachedCfg struct {
 func (s *Service) Lyrics(ctx context.Context, song store.Song) LyricsResult {
 	song = store.NormalizeSong(song)
 	out := LyricsResult{OffsetKey: store.BindingAuto}
-	cfg, cfgWarnings := localLyricsConfig()
+	cfg, cfgWarnings := localLyricsConfigAt(s.dataDir)
 	if len(cfgWarnings) > 0 && out.Warning == "" {
 		out.Warning = strings.Join(cfgWarnings, "；")
 	}
@@ -481,7 +489,7 @@ func (s *Service) PreviewLyricBinding(ctx context.Context, song store.Song, cand
 	if err := binding.Validate(); err != nil {
 		return LyricPreview{}, err
 	}
-	cfg, _ := localLyricsConfig()
+	cfg, _ := localLyricsConfigAt(s.dataDir)
 	lines, label, err := s.linesForBinding(ctx, song, binding, cfg)
 	if err != nil {
 		return LyricPreview{}, err

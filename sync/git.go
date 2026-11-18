@@ -111,8 +111,13 @@ func (g *cliGit) EnsureRepo(ctx context.Context) error {
 		}
 	}
 	if _, err := g.run(ctx, "remote", "get-url", "origin"); err != nil {
-		if _, err := g.run(ctx, "remote", "add", "origin", g.Remote); err != nil {
-			return err
+		// A partially initialized clone can already have an origin while
+		// `get-url` fails (for example while its config is being recovered).
+		// Repair it before attempting to add, keeping repeated init idempotent.
+		if _, setErr := g.run(ctx, "remote", "set-url", "origin", g.Remote); setErr != nil {
+			if _, addErr := g.run(ctx, "remote", "add", "origin", g.Remote); addErr != nil {
+				return addErr
+			}
 		}
 	} else if _, err := g.run(ctx, "remote", "set-url", "origin", g.Remote); err != nil {
 		return err

@@ -67,6 +67,8 @@ type Manager struct {
 	requests  chan Trigger
 	done      chan struct{}
 	started   bool
+	lifecycle sync.Mutex
+	wg        sync.WaitGroup
 	closeOnce sync.Once
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -98,11 +100,19 @@ func (m *Manager) Status() Status { return m.client.Status() }
 
 // Start 启动后台循环；重复调用无副作用。
 func (m *Manager) Start() {
+	m.lifecycle.Lock()
+	defer m.lifecycle.Unlock()
+	select {
+	case <-m.done:
+		return
+	default:
+	}
 	if m.started {
 		return
 	}
 	m.started = true
-	go m.loop()
+	m.wg.Add(1)
+	go func() { defer m.wg.Done(); m.loop() }()
 	if status := m.client.Status(); status.Configured && status.Auto {
 		m.Request(TriggerStartup)
 	}
@@ -111,8 +121,11 @@ func (m *Manager) Start() {
 // Close 停止后台循环；已排队的同步会被取消。
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {
+		m.lifecycle.Lock()
 		m.cancel()
 		close(m.done)
+		m.lifecycle.Unlock()
+		m.wg.Wait()
 	})
 }
 
@@ -166,6 +179,10 @@ func (m *Manager) loop() {
 			return
 		case trigger := <-m.requests:
 			if trigger == TriggerChange {
+				status := m.client.Status()
+				if !status.Configured || !status.Auto {
+					continue
+				}
 				if frozen {
 					if m.client.Status().ConflictTx != "" {
 						continue

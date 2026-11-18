@@ -18,14 +18,21 @@ import (
 
 // Service 是一组无界面依赖的业务操作。它是轻量的，可以在每个 tea.Cmd 里新建。
 type Service struct {
-	sources *source.Registry
-	store   *store.Store
-	lrclib  *lrclib.Client
+	dataDir     string
+	downloadDir string
+	sources     *source.Registry
+	store       *store.Store
+	lrclib      *lrclib.Client
 }
 
 // New 构造业务服务；st 与 lrc 可以为 nil（测试或纯搜索场景）。
 func New(sources *source.Registry, st *store.Store, lrc *lrclib.Client) *Service {
 	return &Service{sources: sources, store: st, lrclib: lrc}
+}
+
+// SetDirectories configures per-runtime paths before the service is shared.
+func (s *Service) SetDirectories(dataDir, downloadDir string) {
+	s.dataDir, s.downloadDir = dataDir, downloadDir
 }
 
 // Sources 返回注册表。

@@ -110,12 +110,17 @@ func (c *Client) Status() Status {
 		Branch:           cfg.Branch,
 		Auth:             AuthLabel(cfg.Remote, token != ""),
 		Auto:             cfg.Auto,
+		SyncAccounts:     cfg.SyncAccounts,
 		KeyCached:        key != nil,
 		LastResult:       st.LastResult,
 		LastError:        st.LastError,
 		KeyIssue:         st.KeyIssue,
 		ConflictTx:       st.ConflictTx,
 		Warnings:         append([]string(nil), st.CredentialWarnings...),
+	}
+	if !cfg.SyncAccounts {
+		status.Warnings = withoutAccountWarnings(status.Warnings, status.KeyIssue)
+		status.KeyIssue = ""
 	}
 	capabilityBackend := requested
 	if capabilityBackend == BackendAuto {
@@ -152,44 +157,51 @@ func (c *Client) Status() Status {
 
 // Probe 检查远端是否已有 meta.json；用于初始化前决定「新建」还是「加入」。
 func (c *Client) Probe(ctx context.Context) (bool, error) {
+	meta, err := c.ProbeMeta(ctx)
+	return meta != nil, err
+}
+
+// ProbeMeta 返回远端元数据；空仓库返回 nil。KeyVersion=0 表示尚未设置登录态口令。
+func (c *Client) ProbeMeta(ctx context.Context) (*Meta, error) {
 	if err := c.acquire(ctx); err != nil {
-		return false, err
+		return nil, err
 	}
 	defer c.release()
 	cfg, err := LoadConfig(c.opts.ConfigPath)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if cfg.Remote == "" {
-		return false, ErrNotConfigured
+		return nil, ErrNotConfigured
 	}
 	token, err := LoadToken(c.opts.TokenPath)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	g, err := c.prepareGit(ctx, cfg, token)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if err := g.Fetch(ctx); err != nil {
 		if errors.Is(err, errEmptyRemote) {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
-	if _, ok, err := g.showFile(ctx, "FETCH_HEAD", MetaFile); err != nil {
-		return false, err
+	if data, ok, err := g.showFile(ctx, "FETCH_HEAD", MetaFile); err != nil {
+		return nil, err
 	} else if ok {
-		return true, nil
+		meta, err := DecodeMeta(data)
+		return &meta, err
 	}
 	files, err := g.LsTree(ctx, "FETCH_HEAD")
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if len(files) > 0 {
-		return false, fmt.Errorf("%w: 远端仓库不是 zero-beat 同步仓库（缺少 meta.json）", ErrCorruptRepo)
+		return nil, fmt.Errorf("%w: 远端仓库不是 zero-beat 同步仓库（缺少 meta.json）", ErrCorruptRepo)
 	}
-	return false, nil
+	return nil, nil
 }
 
 // Configure 保存仓库地址、分支与自动同步开关；remote 为空时拒绝。
@@ -215,10 +227,23 @@ func (c *Client) configure(remote, branch string, auto bool) error {
 	if err != nil {
 		return err
 	}
+	changed := RemoteHash(cfg.Remote) != RemoteHash(remote) || cfg.Branch != branch
 	cfg.Remote = remote
 	cfg.Branch = branch
 	cfg.Auto = auto
-	return SaveConfig(c.opts.ConfigPath, cfg)
+	if err := SaveConfig(c.opts.ConfigPath, cfg); err != nil {
+		return err
+	}
+	if changed {
+		st, err := LoadState(c.statePath())
+		if err != nil {
+			return err
+		}
+		st.LastSyncAt, st.LastResult, st.LastError, st.KeyIssue = 0, "", "", ""
+		st.CredentialWarnings = nil
+		return SaveState(c.statePath(), st)
+	}
+	return nil
 }
 
 // SetAuto 修改自动同步开关。
@@ -236,6 +261,28 @@ func (c *Client) SetAuto(auto bool) error {
 	}
 	cfg.Auto = auto
 	return SaveConfig(c.opts.ConfigPath, cfg)
+}
+
+// SetSyncAccounts 显式启用或关闭本机登录态同步，不触碰远端密文或本地登录态。
+func (c *Client) SetSyncAccounts(enabled bool) error {
+	if err := c.acquire(context.Background()); err != nil {
+		return err
+	}
+	defer c.release()
+	cfg, err := LoadConfig(c.opts.ConfigPath)
+	if err != nil {
+		return err
+	}
+	cfg.SyncAccounts = enabled
+	return SaveConfig(c.opts.ConfigPath, cfg)
+}
+
+// loadSyncKey 确保关闭时连损坏/过期的密钥文件也不影响普通同步。
+func (c *Client) loadSyncKey(cfg Config) (*KeyState, error) {
+	if !cfg.SyncAccounts {
+		return nil, nil
+	}
+	return LoadKeyState(c.opts.KeyPath)
 }
 
 var branchRe = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
@@ -290,12 +337,19 @@ type InitOutcome struct {
 	Synced    Result
 }
 
-// Init 初始化或加入仓库：空仓库生成盐与密钥；已有 meta.json 时校验口令并导入。
-func (c *Client) Init(ctx context.Context, remote, branch string, auto bool, passphrase string) (InitOutcome, error) {
+// Init 初始化或加入仓库；只有启用登录态同步时才需要口令。
+func (c *Client) Init(ctx context.Context, remote, branch string, auto bool, passphrase string) (out InitOutcome, err error) {
 	if err := c.acquire(ctx); err != nil {
 		return InitOutcome{}, err
 	}
 	defer c.release()
+	defer func() {
+		if err != nil {
+			state, _ := LoadState(c.statePath())
+			cfg, _ := LoadConfig(c.opts.ConfigPath)
+			c.recordError(&state, err, cfg)
+		}
+	}()
 	if err := c.configure(remote, branch, auto); err != nil {
 		return InitOutcome{}, err
 	}
@@ -338,6 +392,26 @@ func (c *Client) Init(ctx context.Context, remote, branch string, auto bool, pas
 		if err != nil {
 			return InitOutcome{}, err
 		}
+		if !cfg.SyncAccounts {
+			result, err := c.syncWithLock(ctx, cfg, nil, g, syncRunOptions{})
+			return InitOutcome{Joined: true, Synced: result}, err
+		}
+		if meta.KeyVersion == 0 {
+			// 先建立共同祖先，再用换密钥事务发布第一把密钥。
+			if _, _, err := NewMeta(passphrase, c.now()); err != nil {
+				return InitOutcome{}, err
+			}
+			dataCfg := cfg
+			dataCfg.SyncAccounts = false
+			initial, err := c.syncWithLock(ctx, dataCfg, nil, g, syncRunOptions{})
+			if err != nil {
+				return InitOutcome{}, err
+			}
+			result, err := c.setPassphrase(ctx, cfg, passphrase, true)
+			result.KeymapUpdated = result.KeymapUpdated || initial.KeymapUpdated
+			result.Warnings = append(initial.Warnings, result.Warnings...)
+			return InitOutcome{Joined: true, Synced: result}, err
+		}
 		key, err := meta.Unlock(passphrase)
 		if err != nil {
 			return InitOutcome{}, err
@@ -361,6 +435,26 @@ func (c *Client) Init(ctx context.Context, remote, branch string, auto bool, pas
 		if len(files) > 0 {
 			return InitOutcome{}, fmt.Errorf("%w: 远端仓库不是 zero-beat 同步仓库（缺少 meta.json）", ErrCorruptRepo)
 		}
+	}
+
+	if !cfg.SyncAccounts {
+		// 远端被清空/更换时，本地克隆可能仍有密文；保留对应元数据，
+		// 不能把已有加密仓库改写成 key_version=0。
+		meta, err := LoadMetaFile(c.repoPath())
+		if os.IsNotExist(err) {
+			meta = Meta{V: MetaVersion, CreatedAt: c.now().Unix()}
+		} else if err != nil {
+			return InitOutcome{}, err
+		}
+		data, err := meta.Encode()
+		if err != nil {
+			return InitOutcome{}, err
+		}
+		if err := writeFileAtomic(filepath.Join(c.repoPath(), MetaFile), data, 0o600); err != nil {
+			return InitOutcome{}, err
+		}
+		result, err := c.syncWithLock(ctx, cfg, nil, g, syncRunOptions{skipRecover: true})
+		return InitOutcome{Synced: result}, err
 	}
 
 	// 空仓库：如果本机已有同一远端的密钥，复用它，避免无谓地让其他设备失效。
@@ -433,7 +527,7 @@ func (c *Client) Sync(ctx context.Context) (Result, error) {
 	if cfg.Remote == "" {
 		return Result{}, ErrNotConfigured
 	}
-	key, err := LoadKeyState(c.opts.KeyPath)
+	key, err := c.loadSyncKey(cfg)
 	if err != nil {
 		return Result{}, err
 	}
@@ -445,7 +539,7 @@ func (c *Client) Sync(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	key, err = LoadKeyState(c.opts.KeyPath)
+	key, err = c.loadSyncKey(cfg)
 	if err != nil {
 		return Result{}, err
 	}
@@ -510,6 +604,8 @@ type syncRunOptions struct {
 	skipRecover bool
 	// publishMeta 表示本轮会提交工作区里的 meta.json；密钥按它校验。
 	publishMeta bool
+	// firstKey 不允许首次启用时覆盖其他设备并发设置的口令。
+	firstKey bool
 }
 
 // syncWithLock 由持锁入口调用，并记录同步结果与错误状态。
@@ -577,7 +673,7 @@ func (c *Client) syncLocked(ctx context.Context, cfg Config, key *KeyState, g *G
 	if err != nil {
 		return result, err
 	}
-	if err := c.recoverTransaction(ctx, g); err != nil {
+	if err := c.recoverTransaction(ctx, g, cfg); err != nil {
 		return result, err
 	}
 	if !opts.skipRecover {
@@ -659,13 +755,19 @@ func (c *Client) round(ctx context.Context, g *Git, cfg Config, state *State, ke
 		}
 	}
 
+	if opts.firstKey && hasMeta && remoteMeta.KeyVersion > 0 && (key == nil || remoteMeta.Keycheck != encodeBase64(Keycheck(key.Key))) {
+		return fmt.Errorf("%w: 其他设备已设置口令，请重新加入", ErrKeyMismatch)
+	}
 	keyAvailable, keyVersion, keyIssue := c.checkKey(cfg, remoteMeta, hasMeta, key, hasRemote, opts.publishMeta)
 	result.KeyIssue = keyIssue
 	if keyIssue != nil {
 		result.Warnings = append(result.Warnings, keyIssue.Error())
 	}
 	if !hasRemote && !keyAvailable && !opts.publishMeta {
-		return fmt.Errorf("%w: 远端为空且本机没有可用密钥，请先完成初始化", ErrNotConfigured)
+		_, metaErr := LoadMetaFile(c.repoPath())
+		if cfg.SyncAccounts || metaErr != nil {
+			return fmt.Errorf("%w: 远端为空，请先完成初始化", ErrNotConfigured)
+		}
 	}
 
 	// 新设备首次同步：先把远端快照导入本地库，避免空库导出把远端歌单删光。
@@ -943,6 +1045,12 @@ func (c *Client) round(ctx context.Context, g *Git, cfg Config, state *State, ke
 
 // checkKey 判断本地密钥能否用于当前远端；不能时只跳过凭据，不影响歌单。
 func (c *Client) checkKey(cfg Config, meta Meta, hasMeta bool, key *KeyState, hasRemote bool, publishMeta bool) (bool, int, error) {
+	if !cfg.SyncAccounts {
+		return false, 0, nil
+	}
+	if hasMeta && meta.KeyVersion == 0 && !publishMeta {
+		return false, 0, ErrKeyMissing
+	}
 	if key == nil {
 		if hasMeta {
 			return false, 0, ErrKeyMissing
@@ -1008,8 +1116,8 @@ func pruneAccountFiles(repoDir string, keep map[string][]byte) {
 	}
 }
 
-// upgradeMeta 把工作区里的 meta.json 升到当前版本；已经是当前版本或还没初始化时
-// 返回 false。只改版本号，不重新派生密钥，所以升级对其它设备是纯格式变更。
+// upgradeMeta 把旧元数据升到导出歌单所需的最低版本；v2/v3 保持不变。
+// 只改版本号，不重新派生密钥，所以升级对其它设备是纯格式变更。
 func (c *Client) upgradeMeta() (bool, error) {
 	path := filepath.Join(c.repoPath(), MetaFile)
 	data, err := os.ReadFile(path)
@@ -1023,10 +1131,10 @@ func (c *Client) upgradeMeta() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if meta.V >= MetaVersion {
+	if meta.V >= LibraryMetaVersion {
 		return false, nil
 	}
-	meta.V = MetaVersion
+	meta.V = LibraryMetaVersion
 	encoded, err := meta.Encode()
 	if err != nil {
 		return false, err
@@ -1114,7 +1222,18 @@ func (c *Client) SetPassphrase(ctx context.Context, newPassphrase string) (Resul
 	if cfg.Remote == "" {
 		return Result{}, ErrNotConfigured
 	}
-	key, err := LoadKeyState(c.opts.KeyPath)
+	return c.setPassphrase(ctx, cfg, newPassphrase, false)
+}
+
+func (c *Client) setPassphrase(ctx context.Context, cfg Config, newPassphrase string, firstKey bool) (Result, error) {
+	if !cfg.SyncAccounts {
+		return Result{}, fmt.Errorf("请先开启登录态同步")
+	}
+	keyCfg := cfg
+	if firstKey {
+		keyCfg.SyncAccounts = false
+	}
+	key, err := c.loadSyncKey(keyCfg)
 	if err != nil {
 		return Result{}, err
 	}
@@ -1129,12 +1248,12 @@ func (c *Client) SetPassphrase(ctx context.Context, newPassphrase string) (Resul
 	if err != nil {
 		return Result{}, err
 	}
-	key, err = LoadKeyState(c.opts.KeyPath)
+	key, err = c.loadSyncKey(keyCfg)
 	if err != nil {
 		return Result{}, err
 	}
 
-	if err := c.recoverTransaction(ctx, g); err != nil {
+	if err := c.recoverTransaction(ctx, g, keyCfg); err != nil {
 		return Result{}, err
 	}
 	if err := g.Recover(ctx); err != nil {
@@ -1147,14 +1266,22 @@ func (c *Client) SetPassphrase(ctx context.Context, newPassphrase string) (Resul
 		}
 		empty = true
 	}
-	baseVersion := 1
+	baseVersion := 0
 	if key != nil {
 		baseVersion = key.KeyVersion
 	}
 	if !empty {
 		if data, ok, err := g.showFile(ctx, "FETCH_HEAD", MetaFile); err == nil && ok {
-			if meta, err := DecodeMeta(data); err == nil && meta.KeyVersion > baseVersion {
-				baseVersion = meta.KeyVersion
+			if meta, err := DecodeMeta(data); err == nil {
+				if firstKey && meta.KeyVersion != 0 {
+					return Result{}, fmt.Errorf("%w: 其他设备已设置口令，请重新加入", ErrKeyMismatch)
+				}
+				if meta.KeyVersion == 0 {
+					key = nil
+					baseVersion = 0
+				} else if meta.KeyVersion > baseVersion {
+					baseVersion = meta.KeyVersion
+				}
 			}
 		}
 	}
@@ -1204,7 +1331,7 @@ func (c *Client) SetPassphrase(ctx context.Context, newPassphrase string) (Resul
 	if err = newKey.Save(c.opts.KeyPath); err != nil {
 		return Result{}, err
 	}
-	result, err := c.syncWithLock(ctx, cfg, newKey, g, syncRunOptions{skipRecover: true, publishMeta: true})
+	result, err := c.syncWithLock(ctx, cfg, newKey, g, syncRunOptions{skipRecover: true, publishMeta: true, firstKey: firstKey})
 	if err != nil {
 		if recoveryErr := c.recoverRotation(ctx, g, cfg.Remote); recoveryErr != nil {
 			return result, fmt.Errorf("%w; 换密钥恢复待重试: %v", err, recoveryErr)

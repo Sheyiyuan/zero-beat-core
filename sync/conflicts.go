@@ -171,7 +171,13 @@ func entityForPath(path string) (ConflictEntity, error) {
 
 func cleanRepoPath(path string) (string, error) {
 	path = filepath.ToSlash(strings.TrimSpace(path))
-	if path == "" || strings.HasPrefix(path, "/") || strings.Contains(path, "..") || strings.ContainsAny(path, "\\\x00:") || strings.EqualFold(strings.Split(path, "/")[0], ".git") {
+	first := strings.Split(path, "/")[0]
+	// v1/v2 annotation names contain raw colons: url.PathEscape keeps them.
+	// Preserve those names on Unix, while rejecting drive-qualified paths on
+	// every platform and unsupported Windows paths (including NTFS streams).
+	if path == "" || strings.HasPrefix(path, "/") || strings.Contains(path, "..") ||
+		strings.ContainsAny(path, "\\\x00") || strings.Contains(first, ":") ||
+		!filepath.IsLocal(filepath.FromSlash(path)) || strings.EqualFold(first, ".git") {
 		return "", fmt.Errorf("%w: 非法仓库路径 %q", ErrCorruptRepo, path)
 	}
 	return path, nil

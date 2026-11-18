@@ -17,6 +17,8 @@ import (
 var (
 	_ source.PlaylistWriter       = (*Source)(nil)
 	_ source.CoverHeadersProvider = (*Source)(nil)
+	_ source.CommentReader        = (*Source)(nil)
+	_ source.RelatedRecommender   = (*Source)(nil)
 )
 
 type Source struct {
@@ -74,7 +76,7 @@ func (s *Source) ParseTarget(input string, pageOverride int) (source.Ref, bool, 
 func (s *Source) Caps() source.Capability {
 	return source.CapSearch | source.CapMultiPart | source.CapRemotePlaylists |
 		source.CapOfficialLyrics | source.CapQualitySelect | source.CapLossless |
-		source.CapPlaylistWrite | source.CapAccount
+		source.CapPlaylistWrite | source.CapAccount | source.CapComments | source.CapRelated | source.CapBrowse
 }
 
 // LoggedIn 实现 source.Source。
@@ -243,6 +245,54 @@ func (s *Source) Lyrics(ctx context.Context, ref source.Ref) ([]lyrics.Line, str
 		return nil, "", nil
 	}
 	return out, "B站字幕", nil
+}
+
+// Comments 实现 source.CommentReader。B 站评论按 aid 定位，因此先读取视频信息。
+func (s *Source) Comments(ctx context.Context, ref source.Ref, page int) (source.CommentPage, error) {
+	if ref.Source != source.Bilibili {
+		return source.CommentPage{}, fmt.Errorf("bilibili: 评论引用来源不是 B 站")
+	}
+	info, err := s.client.VideoInfo(ctx, ref.ExternalID)
+	if err != nil {
+		return source.CommentPage{}, err
+	}
+	comments, err := s.client.Comments(ctx, info.Aid, page)
+	if err != nil {
+		return source.CommentPage{}, err
+	}
+	return source.CommentPage{Page: comments.Page, HasMore: comments.HasMore, Notice: comments.Notice, Comments: convertComments(comments.Comments)}, nil
+}
+
+// Related 实现 source.RelatedRecommender。
+func (s *Source) Related(ctx context.Context, ref source.Ref) ([]source.Candidate, error) {
+	if ref.Source != source.Bilibili {
+		return nil, fmt.Errorf("bilibili: 推荐引用来源不是 B 站")
+	}
+	items, err := s.client.Related(ctx, ref.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]source.Candidate, 0, len(items))
+	for _, item := range items {
+		out = append(out, source.Candidate{Track: source.Track{
+			Source: source.Bilibili, ExternalID: item.BVID, Page: 1,
+			Title: item.Title, Artist: item.Author, Duration: item.Duration, Cover: item.Cover,
+		}, Play: item.Play})
+	}
+	return out, nil
+}
+
+func convertComments(items []bili.Comment) []source.Comment {
+	out := make([]source.Comment, 0, len(items))
+	for _, item := range items {
+		var authorRef source.BrowseRef
+		if item.AuthorID != "" {
+			authorRef = source.BrowseRef{Source: source.Bilibili, Kind: source.BrowseUser, ID: item.AuthorID}
+		}
+		out = append(out, source.Comment{ID: item.ID, Author: item.Author, AuthorRef: authorRef, Avatar: item.Avatar,
+			Content: item.Content, Likes: item.Likes, CreatedAt: item.CreatedAt, ReplyCount: item.ReplyCount})
+	}
+	return out
 }
 
 // RemotePlaylists 实现 source.Source。

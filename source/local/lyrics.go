@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sheyiyuan/zero-beat-core/library"
 	"github.com/sheyiyuan/zero-beat-core/lyrics"
+	"github.com/sheyiyuan/zero-beat-core/resource"
 	"github.com/sheyiyuan/zero-beat-core/source"
 	"github.com/sheyiyuan/zero-beat-core/store"
 )
@@ -82,6 +84,16 @@ func (s *Source) Lyrics(ctx context.Context, ref source.Ref) ([]lyrics.Line, str
 	}
 	if path == "" {
 		return nil, "", perr
+	}
+	if resource.IsURI(path) {
+		text := s.store.Setting("local.resource.lyrics:"+song.ID, "")
+		if strings.HasPrefix(text, "zero-lyrics-v1:") {
+			var lines []lyrics.Line
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(text, "zero-lyrics-v1:")), &lines); err == nil {
+				return lines, "本地歌词", nil
+			}
+		}
+		return s.parseText(text), "本地歌词", nil
 	}
 	lines, ferr := s.localLRC(path, song)
 	if len(lines) > 0 {

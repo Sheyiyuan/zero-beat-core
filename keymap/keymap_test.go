@@ -43,6 +43,9 @@ func TestParseKey(t *testing.T) {
 
 func TestDefaultBindings(t *testing.T) {
 	km := Default()
+	if !km.Match(Profiles, key("u", 'u')) || km.Match(Profiles, key("U", 'U')) || km.Match(Profiles, Key{Code: 'u', Mod: ModCtrl}) {
+		t.Fatal("主页应使用小写 u，不抢占 U 或 ctrl+u")
+	}
 	if !km.Match(Next, key("]", ']')) || km.Match(Next, key("n", 'n')) {
 		t.Fatal("默认 next 应为 ]")
 	}

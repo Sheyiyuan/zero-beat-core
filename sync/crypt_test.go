@@ -160,7 +160,7 @@ func TestMetaStrictDecode(t *testing.T) {
 	}
 	data, _ := meta.Encode()
 	var expectFail = [][]byte{
-		bytes.Replace(data, []byte(`"v": 2`), []byte(`"v": 3`), 1),
+		bytes.Replace(data, []byte(`"v": 3`), []byte(`"v": 4`), 1),
 		[]byte(`{"v":1}`),
 		bytes.Replace(data, []byte(`"salt": "`), []byte(`"extra": 1, "salt": "`), 1),
 	}
@@ -170,7 +170,7 @@ func TestMetaStrictDecode(t *testing.T) {
 		}
 	}
 	// v1 仓库仍然可读：升级发生在同步客户端，不在解码器里。
-	v1 := bytes.Replace(data, []byte(`"v": 2`), []byte(`"v": 1`), 1)
+	v1 := bytes.Replace(data, []byte(`"v": 3`), []byte(`"v": 1`), 1)
 	if _, err := DecodeMeta(v1); err != nil {
 		t.Fatalf("v1 meta 应该仍可读取: %v", err)
 	}

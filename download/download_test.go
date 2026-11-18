@@ -98,6 +98,7 @@ func TestDownloadToPartWritesContentAndHeaders(t *testing.T) {
 func TestDownloadToPartResumesWithRange(t *testing.T) {
 	data := []byte("0123456789abcdef")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"same-resource"`)
 		start := 0
 		if rh := r.Header.Get("Range"); rh != "" {
 			_, _ = fmt.Sscanf(rh, "bytes=%d-", &start)
@@ -114,6 +115,9 @@ func TestDownloadToPartResumesWithRange(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "resume.part")
 	if err := os.WriteFile(path, data[:5], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".resume.json", []byte(`{"validator":"\"same-resource\"","total":16}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := downloadToPart(context.Background(), path, source.Stream{URL: srv.URL}, nil); err != nil {

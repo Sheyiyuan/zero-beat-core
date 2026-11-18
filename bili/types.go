@@ -24,6 +24,7 @@ type Video struct {
 	BVID     string
 	Title    string
 	Cover    string
+	OwnerID  int64
 	Owner    string
 	Duration int64 // 秒
 	Pages    []VideoPage
@@ -37,6 +38,36 @@ type SearchItem struct {
 	Cover    string
 	Duration int // 秒
 	Play     int64
+}
+
+// RelatedItem 是视频相关推荐条目。
+type RelatedItem struct {
+	BVID     string
+	Title    string
+	Author   string
+	Cover    string
+	Duration int
+	Play     int64
+}
+
+// Comment 是 B 站评论的统一字段。
+type Comment struct {
+	ID         string
+	Author     string
+	AuthorID   string
+	Avatar     string
+	Content    string
+	Likes      int64
+	CreatedAt  time.Time
+	ReplyCount int
+}
+
+// CommentPage 是 B 站评论分页结果。
+type CommentPage struct {
+	Comments []Comment
+	Page     int
+	HasMore  bool
+	Notice   string
 }
 
 // AudioTrack 是一条 DASH 音频轨。

@@ -30,3 +30,16 @@ func TestMetadataAndQualityMapping(t *testing.T) {
 		t.Fatal("timeMS 换算错误")
 	}
 }
+
+// 新能力是可选接口；原有 Source 契约不要求本地音源提供评论。
+func TestContentCapabilitiesAndMapping(t *testing.T) {
+	s := New(bili.New())
+	if !s.Caps().Has(source.CapComments) || !s.Caps().Has(source.CapRelated) {
+		t.Fatal("missing content capabilities")
+	}
+	created := time.Unix(1700000000, 0)
+	got := convertComments([]bili.Comment{{ID: "1", Author: "读者", Avatar: "https://avatar", Content: "正文", Likes: 3, CreatedAt: created, ReplyCount: 4}})
+	if len(got) != 1 || got[0] != (source.Comment{ID: "1", Author: "读者", Avatar: "https://avatar", Content: "正文", Likes: 3, CreatedAt: created, ReplyCount: 4}) {
+		t.Fatalf("mapping: %+v", got)
+	}
+}

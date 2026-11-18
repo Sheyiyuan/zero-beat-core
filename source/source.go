@@ -45,6 +45,12 @@ const (
 	// CapAccount 表示音源有登录态，需要出现在登录页与账号摘要里。
 	// 本地源不置位，避免把「本机」渲染成需要扫码的音源。
 	CapAccount
+	// CapComments 表示音源支持读取歌曲/视频评论。
+	CapComments
+	// CapRelated 表示音源支持读取当前曲目的相关推荐。
+	CapRelated
+	// CapBrowse 表示可浏览主页与内容集合。
+	CapBrowse
 )
 
 // Has 判断是否具备某项能力。
@@ -122,6 +128,36 @@ type Candidate struct {
 	Track
 	Play int64 // 播放量，未知为 0
 	VIP  bool  // 平台标记为会员/付费才能完整播放
+}
+
+// Comment 是音源返回的一条只读评论。评论内容保持纯文本，UI 不需要了解平台 JSON。
+type Comment struct {
+	ID         string
+	Author     string
+	AuthorRef  BrowseRef // 评论作者主页，未知时为空
+	Avatar     string
+	Content    string
+	Likes      int64
+	CreatedAt  time.Time
+	ReplyCount int
+}
+
+// CommentPage 是一页评论；Page 从 1 开始，HasMore 表示仍可继续请求。
+type CommentPage struct {
+	Comments []Comment
+	Page     int
+	HasMore  bool
+	Notice   string // 如平台仅提供未登录预览；不影响本页展示
+}
+
+// CommentReader 是可选能力：读取一页评论，不要求所有音源实现。
+type CommentReader interface {
+	Comments(ctx context.Context, ref Ref, page int) (CommentPage, error)
+}
+
+// RelatedRecommender 是可选能力：读取当前曲目的相关推荐。
+type RelatedRecommender interface {
+	Related(ctx context.Context, ref Ref) ([]Candidate, error)
 }
 
 // SearchPage 是一页搜索结果。

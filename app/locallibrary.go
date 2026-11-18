@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,6 +50,9 @@ type LibraryScan struct {
 //
 // 路径校验在扫描前完成：用户输入错路径时不该留下一个空歌单。
 func (s *Service) AddLocalFolder(path string) (store.Playlist, LibraryScan, error) {
+	return s.AddLocalFolderContext(context.Background(), path)
+}
+func (s *Service) AddLocalFolderContext(ctx context.Context, path string) (store.Playlist, LibraryScan, error) {
 	if s.store == nil {
 		return store.Playlist{}, LibraryScan{}, fmt.Errorf("没有可用的存储")
 	}
@@ -67,8 +71,11 @@ func (s *Service) AddLocalFolder(path string) (store.Playlist, LibraryScan, erro
 	if err != nil {
 		return store.Playlist{}, LibraryScan{}, err
 	}
-	scan, err := s.RescanLibrary(playlist.ID)
+	scan, err := s.RescanLibraryContext(ctx, playlist.ID)
 	if err != nil {
+		if ctx.Err() != nil {
+			_ = s.store.DeletePlaylist(playlist.ID)
+		}
 		return playlist, scan, err
 	}
 	return scan.Playlist, scan, nil
@@ -79,6 +86,9 @@ func (s *Service) AddLocalFolder(path string) (store.Playlist, LibraryScan, erro
 // 目录不可用时不覆盖已有条目，只更新 scan_status；文件级问题记 warning，
 // 不中断整次扫描。
 func (s *Service) RescanLibrary(playlistID string) (LibraryScan, error) {
+	return s.RescanLibraryContext(context.Background(), playlistID)
+}
+func (s *Service) RescanLibraryContext(ctx context.Context, playlistID string) (LibraryScan, error) {
 	if s.store == nil {
 		return LibraryScan{}, fmt.Errorf("没有可用的存储")
 	}
@@ -99,9 +109,11 @@ func (s *Service) RescanLibrary(playlistID string) (LibraryScan, error) {
 		_ = s.store.UpdatePlaylistScan(playlist.ID, "missing", "文件夹不可用")
 		return out, fmt.Errorf("文件夹不可用：%s", playlist.RootPath)
 	}
-	result, err := library.Scan(playlist.RootPath)
+	result, err := library.ScanContext(ctx, playlist.RootPath)
 	if err != nil {
-		_ = s.store.UpdatePlaylistScan(playlist.ID, "error", err.Error())
+		if ctx.Err() == nil {
+			_ = s.store.UpdatePlaylistScan(playlist.ID, "error", err.Error())
+		}
 		return out, err
 	}
 	out.Subdirs = result.Subdirs
@@ -125,6 +137,9 @@ func (s *Service) RescanLibrary(playlistID string) (LibraryScan, error) {
 	hashes := map[string]map[string]bool{}
 	now := map[string]bool{}
 	for _, file := range result.Files {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		song, reused, warnings := s.identifyFile(playlist.ID, file)
 		out.Warnings = append(out.Warnings, warnings...)
 		if reused {
@@ -250,6 +265,9 @@ func refreshLocalSong(song store.Song, file library.File) store.Song {
 
 // SetLibraryRoot 更换文件夹歌单的目录，并立刻重扫。
 func (s *Service) SetLibraryRoot(playlistID, path string) (LibraryScan, error) {
+	return s.SetLibraryRootContext(context.Background(), playlistID, path)
+}
+func (s *Service) SetLibraryRootContext(ctx context.Context, playlistID, path string) (LibraryScan, error) {
 	abs, err := ExpandPath(path)
 	if err != nil {
 		return LibraryScan{}, err
@@ -261,10 +279,18 @@ func (s *Service) SetLibraryRoot(playlistID, path string) (LibraryScan, error) {
 	if !info.IsDir() {
 		return LibraryScan{}, fmt.Errorf("不是文件夹：%s", abs)
 	}
+	previous, err := s.store.Playlist(playlistID)
+	if err != nil {
+		return LibraryScan{}, err
+	}
 	if err := s.store.SetPlaylistRoot(playlistID, abs); err != nil {
 		return LibraryScan{}, err
 	}
-	return s.RescanLibrary(playlistID)
+	result, err := s.RescanLibraryContext(ctx, playlistID)
+	if ctx.Err() != nil {
+		_ = s.store.SetPlaylistRoot(playlistID, previous.RootPath)
+	}
+	return result, err
 }
 
 // LocalSongs 返回曲库里的本地曲目，供歌词绑定选「本机曲目」。
@@ -282,4 +308,52 @@ func (s *Service) LocalOnlyCounts() (playlists, annotations int) {
 	}
 	playlists, annotations, _ = s.store.LocalOnlyCounts()
 	return playlists, annotations
+}
+
+// ApplyResourceScan commits a complete shallow scan from a granted Android URI.
+// URI and file paths retain separate identities; only Go writes the index.
+func (s *Service) ApplyResourceScan(id, root, title string, files []library.File, lrc map[string]string) (LibraryScan, error) {
+	var out LibraryScan
+	var previous []store.LibraryFile
+	if id != "" {
+		var err error
+		out.Playlist, err = s.store.Playlist(id)
+		if err != nil {
+			return out, err
+		}
+		if out.Playlist.Kind != store.PlaylistKindFolder {
+			return out, fmt.Errorf("不是文件夹歌单")
+		}
+		previous, err = s.store.LibraryFiles(id)
+		if err != nil {
+			return out, err
+		}
+	}
+	present := map[string]bool{}
+	items := make([]store.LibraryItem, 0, len(files))
+	texts := map[string]string{}
+	for _, file := range files {
+		song, reused, warnings := s.identifyFile(id, file)
+		if reused {
+			out.Reused++
+		} else {
+			out.Added++
+		}
+		out.Warnings = append(out.Warnings, warnings...)
+		present[file.Path] = true
+		texts[song.ID] = lrc[file.Path]
+		items = append(items, store.LibraryItem{Song: song, Path: file.Path, Size: file.Size, ModTime: file.ModTime, ContentHash: file.ContentHash})
+	}
+	id, err := s.store.CommitResourceScan(id, root, title, items, texts)
+	if err != nil {
+		return out, err
+	}
+	for _, old := range previous {
+		if old.Present && !present[old.Path] {
+			out.Missing++
+		}
+	}
+	out.Scanned = len(files)
+	out.Playlist, err = s.store.Playlist(id)
+	return out, err
 }

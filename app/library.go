@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sheyiyuan/zero-beat-core/resource"
 	"github.com/sheyiyuan/zero-beat-core/source"
 	"github.com/sheyiyuan/zero-beat-core/store"
 )
@@ -139,7 +140,7 @@ func (s *Service) PlaylistSongs(ctx context.Context, p store.Playlist, force boo
 		// 文件夹歌单的内容随磁盘变化；打开时若距上次扫描超过 60 秒才重扫，
 		// 避免每次切歌单都做一次全量扫描。
 		stale := force || time.Since(time.Unix(p.ScannedAt, 0)) > 60*time.Second
-		if stale {
+		if stale && !resource.IsURI(p.RootPath) {
 			scan, serr := s.RescanLibrary(p.ID)
 			if serr != nil {
 				warn = serr

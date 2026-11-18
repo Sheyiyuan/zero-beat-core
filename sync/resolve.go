@@ -166,7 +166,7 @@ func (c *Client) Resolve(ctx context.Context, txid string, choices map[string]Ch
 	if cfg.Remote == "" {
 		return Result{}, ErrNotConfigured
 	}
-	key, err := LoadKeyState(c.opts.KeyPath)
+	key, err := c.loadSyncKey(cfg)
 	if err != nil {
 		return Result{}, err
 	}
@@ -178,12 +178,12 @@ func (c *Client) Resolve(ctx context.Context, txid string, choices map[string]Ch
 	if err != nil {
 		return Result{}, err
 	}
-	key, err = LoadKeyState(c.opts.KeyPath)
+	key, err = c.loadSyncKey(cfg)
 	if err != nil {
 		return Result{}, err
 	}
 
-	if err := c.recoverTransaction(ctx, g); err != nil {
+	if err := c.recoverTransaction(ctx, g, cfg); err != nil {
 		return Result{}, err
 	}
 	if err := g.Fetch(ctx); err != nil {
@@ -537,7 +537,7 @@ func (c *Client) DiscardConflict(ctx context.Context, txid string) error {
 	}
 	token, _ := LoadToken(c.opts.TokenPath)
 	if g, err := c.prepareGit(ctx, cfg, token); err == nil {
-		if err := c.recoverTransaction(ctx, g); err != nil {
+		if err := c.recoverTransaction(ctx, g, cfg); err != nil {
 			return err
 		}
 		_ = g.AbortMerge(ctx)

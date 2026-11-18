@@ -117,6 +117,7 @@ func (c *Client) VideoInfo(ctx context.Context, bvid string) (Video, error) {
 		Duration int64  `json:"duration"`
 		Owner    struct {
 			Name string `json:"name"`
+			Mid  int64  `json:"mid"`
 		} `json:"owner"`
 		Pages []struct {
 			CID      int64  `json:"cid"`
@@ -134,6 +135,7 @@ func (c *Client) VideoInfo(ctx context.Context, bvid string) (Video, error) {
 		Title:    data.Title,
 		Cover:    normalizeURL(data.Pic),
 		Owner:    data.Owner.Name,
+		OwnerID:  data.Owner.Mid,
 		Duration: data.Duration,
 	}
 	for _, p := range data.Pages {

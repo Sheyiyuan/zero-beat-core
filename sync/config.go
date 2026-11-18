@@ -11,24 +11,26 @@ import (
 
 // Config 是本地 sync.toml：只存连接方式与开关，不存 token 或口令。
 type Config struct {
-	Backend    Backend
-	SSHKey     string
-	KnownHosts string
-	Remote     string
-	Branch     string
-	Auto       bool
+	Backend      Backend
+	SSHKey       string
+	KnownHosts   string
+	Remote       string
+	Branch       string
+	Auto         bool
+	SyncAccounts bool // 登录态同步需在每台设备上主动启用。
 }
 
 type configFile struct {
-	Backend    Backend `toml:"backend"`
-	SSHKey     string  `toml:"ssh_key"`
-	KnownHosts string  `toml:"known_hosts"`
-	Remote     string  `toml:"remote"`
-	Branch     string  `toml:"branch"`
-	Auto       *bool   `toml:"auto"`
+	Backend      Backend `toml:"backend"`
+	SSHKey       string  `toml:"ssh_key"`
+	KnownHosts   string  `toml:"known_hosts"`
+	Remote       string  `toml:"remote"`
+	Branch       string  `toml:"branch"`
+	Auto         *bool   `toml:"auto"`
+	SyncAccounts bool    `toml:"sync_accounts"`
 }
 
-// LoadConfig 读取 sync.toml；文件不存在时返回默认配置（自动同步开启）。
+// LoadConfig 读取 sync.toml；默认自动同步开启、登录态同步关闭（旧配置也如此）。
 func LoadConfig(path string) (Config, error) {
 	cfg := Config{Branch: "main", Auto: true}
 	data, err := os.ReadFile(path)
@@ -51,6 +53,7 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	cfg.Remote = strings.TrimSpace(f.Remote)
+	cfg.SyncAccounts = f.SyncAccounts
 	if b := strings.TrimSpace(f.Branch); b != "" {
 		cfg.Branch = b
 	}
@@ -73,6 +76,7 @@ func SaveConfig(path string, cfg Config) error {
 	b.WriteString("remote = " + strconv.Quote(cfg.Remote) + "\n")
 	b.WriteString("branch = " + strconv.Quote(cfg.Branch) + "\n")
 	b.WriteString("auto = " + strconv.FormatBool(cfg.Auto) + "\n")
+	b.WriteString("sync_accounts = " + strconv.FormatBool(cfg.SyncAccounts) + "\n")
 	if cfg.Backend != "" && cfg.Backend != BackendAuto {
 		b.WriteString("backend = " + strconv.Quote(string(cfg.Backend)) + "\n")
 	}

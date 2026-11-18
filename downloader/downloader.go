@@ -17,6 +17,7 @@ const (
 	Queued State = iota
 	Running
 	Failed // 失败任务保留在列表里，等界面提示或用户重试/清除
+	Complete
 )
 
 // Job 是一次下载的参数，在入队（界面协程）时快照，
@@ -60,14 +61,19 @@ type task struct {
 
 // Manager 负责下载队列与并发调度。
 type Manager struct {
-	mu      sync.Mutex
-	max     int
-	run     Runner
-	tasks   []*task
-	bySong  map[string]int
-	seq     int
-	running int
-	events  chan Event
+	active    map[string]int
+	closed    bool
+	shutdown  chan struct{}
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+	mu        sync.Mutex
+	max       int
+	run       Runner
+	tasks     []*task
+	bySong    map[string]int
+	seq       int
+	running   int
+	events    chan Event
 }
 
 // New 构造下载管理器。
@@ -75,7 +81,7 @@ func New(max int, run Runner) *Manager {
 	if max < 1 {
 		max = 1
 	}
-	return &Manager{max: max, run: run, bySong: map[string]int{}, events: make(chan Event, 256)}
+	return &Manager{shutdown: make(chan struct{}), max: max, run: run, bySong: map[string]int{}, active: map[string]int{}, events: make(chan Event, 256)}
 }
 
 // Events 返回事件流。
@@ -86,6 +92,12 @@ func (m *Manager) Add(song store.Song, title string, job Job) (int, bool) {
 	song = store.NormalizeSong(song)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return 0, false
+	}
+	if id, ok := m.active[song.ID]; ok {
+		return id, false
+	}
 	if id, ok := m.bySong[song.ID]; ok {
 		return id, false
 	}
@@ -123,6 +135,9 @@ func (m *Manager) Start() {
 }
 
 func (m *Manager) startLocked() {
+	if m.closed {
+		return
+	}
 	for m.running < m.max {
 		var next *task
 		for _, t := range m.tasks {
@@ -134,15 +149,19 @@ func (m *Manager) startLocked() {
 		if next == nil {
 			return
 		}
+		m.active[next.Song.ID] = next.ID
 		next.State = Running
 		m.running++
 		ctx, cancel := context.WithCancel(context.Background())
 		next.cancel = cancel
+		m.wg.Add(1)
 		go m.runTask(ctx, next)
 	}
 }
 
 func (m *Manager) runTask(ctx context.Context, t *task) {
+	defer m.wg.Done()
+	defer t.cancel()
 	last := time.Time{}
 	progress := func(done, total int64) {
 		now := time.Now()
@@ -161,9 +180,16 @@ func (m *Manager) runTask(ctx context.Context, t *task) {
 	t.Err = err
 	if err != nil {
 		t.State = Failed
+	} else {
+		t.State = Complete
 	}
 	m.running--
-	delete(m.bySong, t.Song.ID)
+	if m.active[t.Song.ID] == t.ID {
+		delete(m.active, t.Song.ID)
+	}
+	if m.bySong[t.Song.ID] == t.ID {
+		delete(m.bySong, t.Song.ID)
+	}
 	m.mu.Unlock()
 	m.emit(Event{ID: t.ID, Path: path, Size: size, Err: err, Finished: true}, true)
 	m.mu.Lock()
@@ -184,7 +210,10 @@ func runSafely(ctx context.Context, run Runner, song store.Song, job Job, progre
 
 func (m *Manager) emit(ev Event, must bool) {
 	if must {
-		m.events <- ev
+		select {
+		case m.events <- ev:
+		case <-m.shutdown:
+		}
 		return
 	}
 	select {
@@ -199,8 +228,10 @@ func (m *Manager) ClearFinished() {
 	defer m.mu.Unlock()
 	kept := m.tasks[:0]
 	for _, t := range m.tasks {
-		if t.State == Failed {
-			delete(m.bySong, t.Song.ID)
+		if t.State == Failed || t.State == Complete {
+			if m.bySong[t.Song.ID] == t.ID {
+				delete(m.bySong, t.Song.ID)
+			}
 			continue
 		}
 		kept = append(kept, t)
@@ -219,7 +250,9 @@ func (m *Manager) Remove(id int) {
 		if t.cancel != nil {
 			t.cancel()
 		}
-		delete(m.bySong, t.Song.ID)
+		if m.bySong[t.Song.ID] == t.ID {
+			delete(m.bySong, t.Song.ID)
+		}
 		m.tasks = append(m.tasks[:i], m.tasks[i+1:]...)
 		return
 	}
@@ -233,8 +266,11 @@ func (m *Manager) Cancel(id int) bool {
 		if t.ID != id {
 			continue
 		}
-		delete(m.bySong, t.Song.ID)
+		if m.bySong[t.Song.ID] == t.ID {
+			delete(m.bySong, t.Song.ID)
+		}
 		if t.State == Queued {
+			delete(m.bySong, t.Song.ID)
 			m.tasks = append(m.tasks[:i], m.tasks[i+1:]...)
 			return true
 		}
@@ -263,8 +299,10 @@ func (m *Manager) CancelAll() {
 	defer m.mu.Unlock()
 	kept := m.tasks[:0]
 	for _, t := range m.tasks {
-		if t.State == Queued {
+		if m.bySong[t.Song.ID] == t.ID {
 			delete(m.bySong, t.Song.ID)
+		}
+		if t.State == Queued {
 			continue
 		}
 		if t.cancel != nil {
@@ -292,4 +330,27 @@ func (m *Manager) SetProgress(id int, done, total int64) {
 			return
 		}
 	}
+}
+
+// Close cancels queued/running work and waits until no runner can touch storage.
+func (m *Manager) Close() {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		close(m.shutdown)
+		for _, t := range m.tasks {
+			if t.cancel != nil {
+				t.cancel()
+			}
+		}
+		m.mu.Unlock()
+		m.wg.Wait()
+	})
+}
+
+// Busy also includes a cancelled writer which has not released its file yet.
+func (m *Manager) Busy(songID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bySong[songID] != 0 || m.active[songID] != 0
 }

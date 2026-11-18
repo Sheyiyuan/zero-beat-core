@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/sheyiyuan/zero-beat-core/resource"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -590,10 +591,10 @@ func (s *Store) CreateFolderPlaylist(title, rootPath string) (Playlist, error) {
 	if rootPath == "" {
 		return Playlist{}, fmt.Errorf("store: 文件夹路径不能为空")
 	}
-	if !filepath.IsAbs(rootPath) {
+	if !resource.Valid(rootPath) {
 		return Playlist{}, fmt.Errorf("store: 文件夹路径必须是绝对路径")
 	}
-	rootPath = filepath.Clean(rootPath)
+	rootPath = resource.Clean(rootPath)
 	if title = strings.TrimSpace(title); title == "" {
 		title = filepath.Base(rootPath)
 	}

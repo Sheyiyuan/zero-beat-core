@@ -81,6 +81,8 @@ func apiError(code int, message, path string) error {
 var _ source.DailyRecommender = (*Client)(nil)
 var _ source.PlaylistWriter = (*Client)(nil)
 var _ source.SessionRefresher = (*Client)(nil)
+var _ source.CommentReader = (*Client)(nil)
+var _ source.RelatedRecommender = (*Client)(nil)
 
 type Client struct {
 	// opMu 串行化协议层调用：go-musicfox/netease-music 使用全局 cookie jar，
@@ -140,16 +142,34 @@ func (c *Client) ParseTarget(input string, _ int) (source.Ref, bool, error) {
 	if input == "" {
 		return source.Ref{}, false, nil
 	}
+	if strings.HasPrefix(input, programPrefix) {
+		if err := validateContentID(strings.TrimPrefix(input, programPrefix)); err != nil {
+			return source.Ref{}, true, err
+		}
+		return source.Ref{Source: source.NetEase, ExternalID: input, Page: 1}, true, nil
+	}
 	if u, err := url.Parse(input); err == nil && u.Host != "" {
-		if !strings.Contains(strings.ToLower(u.Host), "music.163.com") {
+		host := strings.ToLower(u.Hostname())
+		if host != "music.163.com" && host != "y.music.163.com" {
+			return source.Ref{}, false, nil
+		}
+		if strings.HasPrefix(u.Fragment, "/") {
+			var err error
+			u, err = url.Parse(u.Fragment)
+			if err != nil {
+				return source.Ref{}, true, fmt.Errorf("netease: 链接无效: %w", err)
+			}
+		}
+		kind := strings.Trim(u.Path, "/")
+		if kind != "song" && kind != "program" {
 			return source.Ref{}, false, nil
 		}
 		id := strings.TrimSpace(u.Query().Get("id"))
-		if id == "" {
-			return source.Ref{}, false, nil
+		if err := validateContentID(id); err != nil {
+			return source.Ref{}, true, err
 		}
-		if _, err := strconv.ParseInt(id, 10, 64); err != nil {
-			return source.Ref{}, true, fmt.Errorf("netease: 歌曲 ID 无效: %s", id)
+		if kind == "program" {
+			id = programPrefix + id
 		}
 		return source.Ref{Source: source.NetEase, ExternalID: id, Page: 1}, true, nil
 	}
@@ -163,7 +183,7 @@ func (c *Client) ParseTarget(input string, _ int) (source.Ref, bool, error) {
 func (c *Client) Caps() source.Capability {
 	return source.CapSearch | source.CapRemotePlaylists | source.CapOfficialLyrics |
 		source.CapQualitySelect | source.CapLossless | source.CapDailyRecommendations |
-		source.CapPlaylistWrite | source.CapAccount
+		source.CapPlaylistWrite | source.CapAccount | source.CapComments | source.CapRelated | source.CapBrowse
 }
 
 // LoggedIn 实现 source.Source。
@@ -418,6 +438,7 @@ func loginStatus(code int, body []byte) source.LoginStatus {
 }
 
 type neArtist struct {
+	ID   int64  `json:"id"`
 	Name string `json:"name"`
 }
 
@@ -546,25 +567,44 @@ func parseSearch(body []byte, page, limit int) (source.SearchPage, error) {
 func (c *Client) Resolve(ctx context.Context, ref source.Ref, quality source.Quality) (source.Resolved, error) {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
-	id, err := strconv.ParseInt(ref.ExternalID, 10, 64)
-	if err != nil {
+	audioID := ref.ExternalID
+	var program *source.Track
+	if strings.HasPrefix(audioID, programPrefix) {
+		p, err := c.programLocked(ctx, audioID)
+		if err != nil {
+			return source.Resolved{}, err
+		}
+		t := p.track()
+		program = &t
+		audioID = strconv.FormatInt(p.MainSong.ID, 10)
+	}
+	id, err := strconv.ParseInt(audioID, 10, 64)
+	if err != nil || id <= 0 {
 		return source.Resolved{}, fmt.Errorf("netease: 歌曲 ID 无效: %s", ref.ExternalID)
 	}
 	if err := ctx.Err(); err != nil {
 		return source.Resolved{}, err
 	}
-	svc := &neaservice.SongUrlV1Service{
-		ID:         strconv.FormatInt(id, 10),
-		Level:      levelFor(quality),
-		SkipUNM:    true,
-		EncodeType: encodeTypeFor(quality),
+	var code float64
+	var body []byte
+	path := "song/enhance/player/url/v1"
+	if program != nil {
+		// 节目 mainSong 使用标准取流接口；V1 会对公开节目返回 -462。
+		svc := &neaservice.SongUrlService{ID: strconv.FormatInt(id, 10), Br: "320000", SkipUNM: true}
+		path = "song/enhance/player/url"
+		code, body = svc.SongUrl()
+	} else {
+		svc := &neaservice.SongUrlV1Service{ID: strconv.FormatInt(id, 10), Level: levelFor(quality), SkipUNM: true, EncodeType: encodeTypeFor(quality)}
+		code, body, err = svc.SongUrl()
 	}
-	code, body, err := svc.SongUrl()
+	if err := ctx.Err(); err != nil {
+		return source.Resolved{}, err
+	}
 	if err != nil {
 		return source.Resolved{}, fmt.Errorf("netease: 取流: %w", err)
 	}
 	if code != 200 {
-		return source.Resolved{}, &APIError{Code: int(code), Message: "取流失败", Path: "song/enhance/player/url/v1"}
+		return source.Resolved{}, apiError(int(code), "取流失败", path)
 	}
 	resolved, err := parseResolved(body, ref.ExternalID)
 	if err != nil {
@@ -572,6 +612,12 @@ func (c *Client) Resolve(ctx context.Context, ref source.Ref, quality source.Qua
 	}
 	if resolved.Stream.URL == "" {
 		return source.Resolved{}, fmt.Errorf("netease: 该曲目无版权或需要会员")
+	}
+	if err := ctx.Err(); err != nil {
+		return source.Resolved{}, err
+	}
+	if program != nil {
+		resolved.Track = *program
 	}
 	resolved.Stream.Headers = map[string]string{
 		"Referer":    musicHost + "/",
@@ -583,12 +629,16 @@ func (c *Client) Resolve(ctx context.Context, ref source.Ref, quality source.Qua
 	return resolved, nil
 }
 
-// Track 读取单曲元数据，供下载等非 TUI 场景使用。
+// Track 读取单曲或节目元数据，供下载等非 TUI 场景使用。
 func (c *Client) Track(ctx context.Context, ref source.Ref) (source.Track, error) {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return source.Track{}, err
+	}
+	if strings.HasPrefix(ref.ExternalID, programPrefix) {
+		p, err := c.programLocked(ctx, ref.ExternalID)
+		return p.track(), err
 	}
 	id, err := strconv.ParseInt(ref.ExternalID, 10, 64)
 	if err != nil {
@@ -713,6 +763,9 @@ func qualityLabel(level string, br int) string {
 
 // Lyrics 实现 source.Source。
 func (c *Client) Lyrics(ctx context.Context, ref source.Ref) ([]lyrics.Line, string, error) {
+	if strings.HasPrefix(ref.ExternalID, programPrefix) {
+		return nil, "", ctx.Err()
+	}
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -918,6 +971,9 @@ func (c *Client) PlaylistTracks(ctx context.Context, remoteID string) ([]source.
 
 // AddToPlaylist 实现 source.PlaylistWriter：把一首歌加入当前账号的网易云歌单。
 func (c *Client) AddToPlaylist(ctx context.Context, remoteID string, ref source.Ref) error {
+	if strings.HasPrefix(ref.ExternalID, programPrefix) {
+		return fmt.Errorf("netease: 播客节目请加入本地歌单，云端歌曲歌单不支持节目")
+	}
 	if ref.Source != source.NetEase {
 		return fmt.Errorf("netease: 不能把 %s 的歌曲加入网易云歌单", ref.Source)
 	}

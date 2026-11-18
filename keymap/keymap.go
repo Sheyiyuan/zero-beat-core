@@ -24,6 +24,10 @@ const (
 	Search           Action = "search"
 	QueueView        Action = "queue_view"
 	LyricsView       Action = "lyrics_view"
+	Comments         Action = "comments"
+	Related          Action = "related"
+	Profiles         Action = "profiles"
+	CommentAuthor    Action = "comment_author"
 	PlayPause        Action = "play_pause"
 	Next             Action = "next"
 	Previous         Action = "previous"
@@ -95,6 +99,10 @@ var Defaults = map[Action][]string{
 	Search:           {"?"},
 	QueueView:        {"c"},
 	LyricsView:       {"T", "ctrl+l"},
+	Comments:         {"i"},
+	Related:          {"I"},
+	Profiles:         {"u"},
+	CommentAuthor:    {"O"},
 	PlayPause:        {"space"},
 	Next:             {"]"},
 	Previous:         {"["},
