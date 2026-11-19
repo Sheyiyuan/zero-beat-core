@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -305,6 +306,53 @@ func TestUsersDetectsExpiredSessionAndLogoutFreezes(t *testing.T) {
 	}
 }
 
+type memorySession struct {
+	*baseFake
+	session map[string]string
+	sets    int
+}
+
+func (m *memorySession) Session() map[string]string {
+	out := make(map[string]string, len(m.session))
+	for key, value := range m.session {
+		out[key] = value
+	}
+	return out
+}
+
+func (m *memorySession) SetSession(cookies map[string]string) {
+	m.sets++
+	m.session = make(map[string]string, len(cookies))
+	for key, value := range cookies {
+		m.session[key] = value
+	}
+}
+
+func TestApplyStoredSessionsSkipsUnchangedLogin(t *testing.T) {
+	st := openTestStore(t)
+	payload := []byte(`{"MUSIC_U":"token-1"}`)
+	if err := st.SaveAccount("netease", payload); err != nil {
+		t.Fatalf("保存登录态失败: %v", err)
+	}
+	src := &memorySession{
+		baseFake: &baseFake{id: "netease", logged: true},
+		session:  map[string]string{"MUSIC_U": "token-1"},
+	}
+	svc := New(source.NewRegistry(src), st, nil)
+
+	if got := svc.ApplyStoredSessions(); len(got) != 0 || src.sets != 0 {
+		t.Fatalf("相同登录态不应再次写入音源: applied=%v sets=%d", got, src.sets)
+	}
+
+	if err := st.SaveAccount("netease", []byte(`{"MUSIC_U":"token-2"}`)); err != nil {
+		t.Fatalf("更新登录态失败: %v", err)
+	}
+	got := svc.ApplyStoredSessions()
+	if len(got) != 1 || got[0] != "netease" || src.sets != 1 || src.session["MUSIC_U"] != "token-2" {
+		t.Fatalf("登录态变化后应回填: applied=%v sets=%d session=%v", got, src.sets, src.session)
+	}
+}
+
 func TestRefreshSessionsPersistsRotatedSession(t *testing.T) {
 	st := openTestStore(t)
 	old := time.Now().Add(-24 * time.Hour).Unix()
@@ -551,5 +599,107 @@ func TestCreatePlaylistWithSongsKeepsOrder(t *testing.T) {
 	}
 	if got, _ = st.PlaylistSongs(p.ID); len(got) != 3 {
 		t.Fatalf("重复歌曲不应增加条目: %+v", got)
+	}
+}
+
+func TestRefreshSessionsUsesRefreshMarkerNotAccountUpdatedAt(t *testing.T) {
+	st := openTestStore(t)
+	now := time.Now().Unix()
+	if err := st.SaveAccountAt("fake", []byte(`{"MUSIC_U":"old"}`), now); err != nil {
+		t.Fatalf("保存登录态失败: %v", err)
+	}
+	if err := st.SetSetting(refreshMarkerPrefix+"fake", strconv.FormatInt(now-7*3600, 10)); err != nil {
+		t.Fatalf("写入续期标记失败: %v", err)
+	}
+	src := &refreshFake{
+		baseFake: &baseFake{id: "fake", logged: true},
+		session:  map[string]string{"MUSIC_U": "new"},
+	}
+	svc := New(source.NewRegistry(src), st, nil)
+
+	if got := svc.RefreshSessions(context.Background()); len(got) != 1 {
+		t.Fatalf("续期标记已过期时应续期: %+v", got)
+	}
+	if src.refreshes != 1 {
+		t.Fatalf("应调用一次续期: %d", src.refreshes)
+	}
+	if got := st.Setting(refreshMarkerPrefix+"fake", ""); got == "" {
+		t.Fatal("续期成功后应更新续期标记")
+	}
+}
+
+func TestUsersKeepsSessionOnTransientRefreshFailure(t *testing.T) {
+	st := openTestStore(t)
+	src := &refreshFake{
+		baseFake:   &baseFake{id: "fake", logged: true},
+		session:    map[string]string{"MUSIC_U": "old"},
+		refreshErr: errors.New("network unavailable"),
+		accountFns: []error{source.ErrSessionExpired},
+	}
+	svc := New(source.NewRegistry(src), st, nil)
+
+	_, expired := svc.Users(context.Background())
+	if len(expired) != 0 {
+		t.Fatalf("续期网络失败不应冻结账号: %+v", expired)
+	}
+}
+
+func TestPersistSessionsWritesRotatedCookies(t *testing.T) {
+	st := openTestStore(t)
+	if err := st.SaveAccount("fake", []byte(`{"MUSIC_U":"old"}`)); err != nil {
+		t.Fatalf("保存登录态失败: %v", err)
+	}
+	src := &refreshFake{
+		baseFake: &baseFake{id: "fake", logged: true},
+		session:  map[string]string{"MUSIC_U": "new"},
+	}
+	svc := New(source.NewRegistry(src), st, nil)
+
+	svc.PersistSessions()
+	payload, err := st.LoadAccount("fake")
+	if err != nil || !strings.Contains(string(payload), "new") {
+		t.Fatalf("普通请求轮换后的 Cookie 应落盘: %s err=%v", payload, err)
+	}
+}
+
+type resolveRefreshFake struct {
+	*refreshFake
+	resolveCalls int
+}
+
+func (f *resolveRefreshFake) Resolve(context.Context, source.Ref, source.Quality) (source.Resolved, error) {
+	f.resolveCalls++
+	if f.resolveCalls == 1 {
+		return source.Resolved{}, source.ErrSessionExpired
+	}
+	return source.Resolved{
+		Track:  source.Track{Source: "fake", ExternalID: "1", Title: "song"},
+		Stream: source.Stream{URL: "https://example.test/audio"},
+	}, nil
+}
+
+func TestStreamRefreshesAndRetriesExpiredSession(t *testing.T) {
+	st := openTestStore(t)
+	if err := st.SaveAccount("fake", []byte(`{"MUSIC_U":"old"}`)); err != nil {
+		t.Fatalf("保存登录态失败: %v", err)
+	}
+	src := &resolveRefreshFake{refreshFake: &refreshFake{
+		baseFake: &baseFake{id: "fake", logged: true},
+		session:  map[string]string{"MUSIC_U": "new"},
+	}}
+	svc := New(source.NewRegistry(src), st, nil)
+
+	_, stream, err := svc.Stream(context.Background(), store.Song{
+		Source: "fake", RemoteID: "1", Title: "song",
+	}, source.QualityLossless)
+	if err != nil || stream.URL == "" {
+		t.Fatalf("续期后应重试取流: stream=%+v err=%v", stream, err)
+	}
+	if src.refreshes != 1 || src.resolveCalls != 2 {
+		t.Fatalf("应续期一次并重试一次: refreshes=%d resolveCalls=%d", src.refreshes, src.resolveCalls)
+	}
+	payload, err := st.LoadAccount("fake")
+	if err != nil || !strings.Contains(string(payload), "new") {
+		t.Fatalf("重试前的续期 Cookie 应落盘: %s err=%v", payload, err)
 	}
 }

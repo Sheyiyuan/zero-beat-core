@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/sheyiyuan/zero-beat-core/source"
@@ -104,6 +105,10 @@ func (s *Service) SaveAccount(id source.ID, session map[string]string) error {
 // 否则频繁重启会反复轮换 token，把同账号的其它客户端顶掉。
 const refreshMinAge = 6 * time.Hour
 
+// refreshMarkerPrefix 记录上次主动续期的时间，不能拿 accounts.updated_at
+// 代替：普通请求也可能轮换 Cookie，保存 Cookie 不等于刚续过期。
+const refreshMarkerPrefix = "auth_refresh_at:"
+
 // RefreshSessions 给支持续期的已登录音源换发登录态，并把新会话写回数据库。
 //
 // 续期失败不在这里清理账号：网络错误留给下一次重试，平台判定的过期仍由
@@ -127,6 +132,7 @@ func (s *Service) RefreshSessions(ctx context.Context) []source.ID {
 		if err := refresher.RefreshSession(ctx); err != nil {
 			continue
 		}
+		s.markSessionRefreshed(src.ID())
 		if s.persistSession(src) {
 			refreshed = append(refreshed, src.ID())
 		}
@@ -134,12 +140,17 @@ func (s *Service) RefreshSessions(ctx context.Context) []source.ID {
 	return refreshed
 }
 
-// sessionFreshEnough 判断登录态是不是刚存过；续期本身会写库，
-// 所以 updated_at 同时就是上一次续期的时间。
+// sessionFreshEnough 判断距上次主动续期是否不足 refreshMinAge。
 func (s *Service) sessionFreshEnough(id source.ID) bool {
 	if s.store == nil {
 		return false
 	}
+	raw := s.store.Setting(refreshMarkerPrefix+string(id), "")
+	if ts, err := strconv.ParseInt(raw, 10, 64); err == nil && ts > 0 {
+		return time.Since(time.Unix(ts, 0)) < refreshMinAge
+	}
+	// 兼容升级前的账号：没有续期标记时，用最近一次登录/保存时间兜底，
+	// 避免升级后立刻把所有账号都轮换一遍。
 	_, updatedAt, err := s.store.LoadAccountAt(string(id))
 	if err != nil || updatedAt <= 0 {
 		return false
@@ -147,11 +158,36 @@ func (s *Service) sessionFreshEnough(id source.ID) bool {
 	return time.Since(time.Unix(updatedAt, 0)) < refreshMinAge
 }
 
+func (s *Service) markSessionRefreshed(id source.ID) {
+	if s.store == nil {
+		return
+	}
+	_ = s.store.SetSetting(refreshMarkerPrefix+string(id), strconv.FormatInt(time.Now().Unix(), 10))
+}
+
+// PersistSessions 把各音源当前 Cookie 写回数据库。普通 API 响应也可能
+// 通过 Set-Cookie 轮换登录态，不能只依赖 12 小时一次的主动续期。
+func (s *Service) PersistSessions() {
+	if s.sources == nil {
+		return
+	}
+	for _, src := range s.sources.All() {
+		if src.LoggedIn() {
+			s.persistSession(src)
+		}
+	}
+}
+
 // persistSession 只在会话真的变化时写库。账号校验每 15 分钟跑一次，如果
 // 每次都写会反复刷新 updated_at、解冻歌单，还会让同步误以为库被改过。
 func (s *Service) persistSession(src source.Source) bool {
 	if s.store == nil || !src.LoggedIn() {
 		return false
+	}
+	// 第一次保存登录态（或升级后第一次运行）时建立续期基准，避免普通请求
+	// 不断刷新 accounts.updated_at，导致主动续期永远被判定为“刚存过”。
+	if s.store.Setting(refreshMarkerPrefix+string(src.ID()), "") == "" {
+		s.markSessionRefreshed(src.ID())
 	}
 	payload, err := json.Marshal(src.Session())
 	if err != nil {

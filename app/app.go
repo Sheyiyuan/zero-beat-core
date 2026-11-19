@@ -173,6 +173,17 @@ func (s *Service) Stream(ctx context.Context, song store.Song, quality source.Qu
 		return source.Track{}, source.Stream{}, fmt.Errorf("未知音源 %q", song.Source)
 	}
 	resolved, err := src.Resolve(ctx, RefFromSong(song), quality)
+	if errors.Is(err, source.ErrSessionExpired) {
+		// 播放时才发现 token 过期很常见；先续期并重试一次，避免用户正在
+		// 听的歌直接报错，也避免把还能救回来的账号标成未登录。
+		if refresher, ok := src.(source.SessionRefresher); ok {
+			if rerr := refresher.RefreshSession(ctx); rerr == nil {
+				s.persistSession(src)
+				resolved, err = src.Resolve(ctx, RefFromSong(song), quality)
+			}
+		}
+	}
+	s.persistSession(src)
 	if err != nil {
 		return source.Track{}, source.Stream{}, err
 	}
@@ -309,19 +320,26 @@ func (s *Service) Users(ctx context.Context) (map[source.ID]source.User, []sourc
 		}
 		got, err := src.Account(ctx)
 		if errors.Is(err, source.ErrSessionExpired) {
-			// 本地存的是旧 token、或平台刚刚换发过 token 时，先续期再判死刑；
-			// 续期失败说明平台确实不认这份登录态，保持原错误交给下面处理。
+			// 本地存的是旧 token、或平台刚刚换发过 token 时，先续期再判死刑。
+			// 只有平台明确拒绝续期才冻结；网络/风控错误不能当成过期。
 			if refresher, ok := src.(source.SessionRefresher); ok {
-				if rerr := refresher.RefreshSession(ctx); rerr == nil {
+				rerr := refresher.RefreshSession(ctx)
+				switch {
+				case rerr == nil:
 					again, aerr := src.Account(ctx)
 					switch {
 					case aerr == nil:
 						got, err = again, nil
+						s.markSessionRefreshed(src.ID())
 						s.persistSession(src)
 					case !errors.Is(aerr, source.ErrSessionExpired):
 						// 续期成功但账号接口网络异常：保留「已登录」，不要冻结。
 						err = aerr
 					}
+				case !errors.Is(rerr, source.ErrSessionExpired):
+					// 续期接口网络/风控失败，不等于平台拒绝登录态。把错误
+					// 换成普通错误，下面的 switch 不会把账号冻结。
+					err = rerr
 				}
 			}
 		}

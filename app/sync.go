@@ -35,8 +35,25 @@ func (s *Service) ApplyStoredSessions() []source.ID {
 		if err := json.Unmarshal(payload, &session); err != nil || len(session) == 0 {
 			continue
 		}
+		// 内容没变就不要 SetSession。网易云的协议层用进程级 cookie jar，
+		// 重复写入会把它整个换掉。
+		if sameSession(src.Session(), session) {
+			continue
+		}
 		src.SetSession(session)
 		out = append(out, src.ID())
 	}
 	return out
+}
+
+func sameSession(current, stored map[string]string) bool {
+	if len(current) != len(stored) {
+		return false
+	}
+	for key, value := range current {
+		if stored[key] != value {
+			return false
+		}
+	}
+	return true
 }
