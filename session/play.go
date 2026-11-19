@@ -364,8 +364,22 @@ func (s *Session) playReplacingQueue(in PlayInput) (int, error) {
 		}
 		idx = found
 	}
-	s.ctrl.LoadQueue(songs, idx)
-	req := s.startPlay(songs[idx], in.StartAt, 0, PlayIntent{PlayWhenReady: true})
+	if len(songs) == 0 {
+		return 0, ErrNotFound
+	}
+	if in.RandomStart && in.Song == nil && s.ctrl.Mode() == player.ModeShuffle {
+		if !s.ctrl.LoadQueueRandom(songs) {
+			return 0, ErrNotFound
+		}
+	} else {
+		s.ctrl.LoadQueue(songs, idx)
+	}
+	queue := s.ctrl.Queue()
+	if len(queue) == 0 {
+		return 0, ErrNotFound
+	}
+	current := queue[s.ctrl.Index()]
+	req := s.startPlay(current, in.StartAt, 0, PlayIntent{PlayWhenReady: true})
 	s.ctrl.Persist()
 	return req, nil
 }
@@ -427,7 +441,7 @@ func (s *Session) remember(song store.Song) store.Song {
 
 func (s *Session) clipFor(song store.Song) store.Clip {
 	if s.clipPreviewSong == song.ID {
-		return store.Clip{}
+		return s.clipPreviewClip
 	}
 	if s.svc == nil || song.ID == "" {
 		return store.Clip{}
@@ -446,6 +460,7 @@ func (s *Session) startPlay(song store.Song, at time.Duration, retry int, intent
 	}
 	if s.clipPreviewSong != song.ID {
 		s.clipPreviewSong = ""
+		s.clipPreviewClip = store.Clip{}
 	}
 	s.intent = intent
 	s.playWhenReady = intent.PlayWhenReady
@@ -591,6 +606,15 @@ func (s *Session) applyEventResult(res player.EventResult) {
 		s.setNotice("正在重试…", "warn")
 		s.startPlay(res.Song, res.StartAt, s.ctrl.Export().Retry, s.intent)
 	case res.Ended:
+		// A clip preview ends at its B point without advancing the queue. The
+		// editor must stay pinned to the same song so it can save or cancel.
+		if s.clipPreviewSong != "" {
+			s.playWhenReady = false
+			s.intent.PlayWhenReady = false
+			s.setPlaybackState(media.StatePaused)
+			s.publish()
+			return
+		}
 		s.advanceFromEnd()
 	case res.Err != nil:
 		s.setNotice("播放失败："+res.Err.Error(), "error")

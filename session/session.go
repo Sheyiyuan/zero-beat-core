@@ -50,6 +50,7 @@ type Session struct {
 
 	features        *Features
 	clipPreviewSong string
+	clipPreviewClip store.Clip
 	clipTarget      string
 	clipEpoch       uint64
 	dir             string

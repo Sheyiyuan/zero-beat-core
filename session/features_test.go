@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/sheyiyuan/zero-beat-core/media"
+	"github.com/sheyiyuan/zero-beat-core/player"
 	"github.com/sheyiyuan/zero-beat-core/store"
 	"testing"
 	"time"
@@ -32,6 +33,43 @@ func TestBatchPlaylistIncludesBeyondVisiblePage(t *testing.T) {
 	snapshot := s.Snapshot().Player
 	if len(snapshot.Queue) != 251 || snapshot.Index != 230 {
 		t.Fatalf("visible-page truncation: %d/%d", snapshot.Index, len(snapshot.Queue))
+	}
+}
+
+func TestPlayAllShufflesFirstSong(t *testing.T) {
+	s := openTestSession(t, newFakeEngine(), newFakeSource())
+	f := s.Features()
+	ctx := context.Background()
+	p, err := f.CreatePlaylist(ctx, PlaylistEdit{Title: "完整歌单"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	songs := []store.Song{testSong("a", "A"), testSong("b", "B"), testSong("c", "C")}
+	if _, err := f.Batch(ctx, "add", p.ID, Selection{Songs: songs}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMode(ctx, player.ModeShuffle); err != nil {
+		t.Fatal(err)
+	}
+	s.ctrl.SetShuffleFunc(func(queue []store.Song) {
+		for i, j := 0, len(queue)-1; i < j; i, j = i+1, j-1 {
+			queue[i], queue[j] = queue[j], queue[i]
+		}
+	})
+	if _, err := f.Batch(ctx, "play", p.ID, Selection{PlaylistID: p.ID}); err != nil {
+		t.Fatal(err)
+	}
+	current := s.Snapshot().Player.Current
+	if current == nil || current.Title != "C" {
+		t.Fatalf("随机播放全部应从洗牌后的第一首开始: %+v", current)
+	}
+	want := store.NormalizeSong(songs[0]).ID
+	if _, err := f.Batch(ctx, "play", want, Selection{PlaylistID: p.ID}); err != nil {
+		t.Fatal(err)
+	}
+	current = s.Snapshot().Player.Current
+	if current == nil || current.ID != want {
+		t.Fatalf("点歌应保留选中曲目: %+v", current)
 	}
 }
 func TestLoadingPauseResumeUsesLatestIntent(t *testing.T) {
@@ -110,6 +148,42 @@ func TestGUISettingsDoNotOverwriteTUIKeymap(t *testing.T) {
 	status, err := f.SyncStatus(ctx)
 	if err != nil || status.SyncAccounts {
 		t.Fatalf("account sync must default off: %+v %v", status, err)
+	}
+}
+
+func TestGUISettingsHapticsDefaultsOnAndPersists(t *testing.T) {
+	s := openTestSession(t, newFakeEngine(), newFakeSource())
+	ctx := context.Background()
+	f := s.Features()
+	settings, err := f.GUISettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Haptics {
+		t.Fatal("haptic feedback must default on")
+	}
+	settings.Theme = "dark"
+	settings.Haptics = false
+	if err = f.SaveGUISettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = f.GUISettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Haptics {
+		t.Fatal("disabled haptic feedback was not persisted")
+	}
+	// Preferences written before this field existed keep the default.
+	if err = s.store.SetSetting("gui.settings", `{"theme":"dark","palette":"zero-red","close_action":"background","shortcuts":{},"window":""}`); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := f.GUISettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !legacy.Haptics {
+		t.Fatal("existing settings without the field must keep haptics on")
 	}
 }
 
@@ -207,6 +281,42 @@ func TestWorkFamiliesDoNotBlockPlaybackOrEachOther(t *testing.T) {
 	default:
 		t.Fatal("close returned before accepted work drained")
 	}
+}
+
+func TestClipPreviewUsesRequestedRange(t *testing.T) {
+	engine := newFakeEngine()
+	s := openTestSession(t, engine, newFakeSource())
+	f, ctx := s.Features(), context.Background()
+	song := testSong("a", "a")
+	if _, err := s.Play(ctx, PlayInput{Song: &song}); err != nil {
+		t.Fatal(err)
+	}
+	waitLoad(t, engine, 1)
+	id := s.Snapshot().Player.Current.ID
+	token, _, err := f.BeginClip(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clip := store.Clip{StartMS: 10000, EndMS: 20000}
+	if err := f.EditClip(ctx, id, "preview", clip, 10000, token); err != nil {
+		t.Fatal(err)
+	}
+	load := waitLoad(t, engine, 2)
+	engine.mu.Lock()
+	stream := engine.stream
+	at := engine.position
+	engine.mu.Unlock()
+	if stream.ClipStartMS != clip.StartMS || stream.ClipEndMS != clip.EndMS {
+		t.Fatalf("preview stream clip = %d..%d, want %d..%d", stream.ClipStartMS, stream.ClipEndMS, clip.StartMS, clip.EndMS)
+	}
+	if at != 10*time.Second {
+		t.Fatalf("preview start = %v, want 10s", at)
+	}
+	engine.emit(EngineEvent{PlaybackID: load.id, Seq: 1, Type: media.EventEnded, State: media.StateEnded})
+	waitFor(t, 2*time.Second, func() bool {
+		snap := s.Snapshot().Player
+		return snap.Current != nil && snap.Current.ID == id && snap.PlaybackState == media.StatePaused
+	})
 }
 
 func TestClipCancelRestoresStoredClipAndLatestPauseIntent(t *testing.T) {

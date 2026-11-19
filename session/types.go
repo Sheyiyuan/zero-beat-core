@@ -104,12 +104,15 @@ type LinkResult struct {
 // PlayInput 选择要播放的曲目。Song 非空时优先使用它（搜索结果尚未入库）。
 // Queue 非空时用这份列表替换当前队列，再从 Song 或 QueueIndex 起播。
 // QueueIndex >= 0 且没有新队列时，改为播放队列中的该位置。StartAt 是绝对起点。
+// RandomStart 表示「播放全部」：随机模式下第一首也参与洗牌，和 TUI 从歌单开头播放一致。
+// 显式点某一首时不要置位，那首歌必须留在当前索引。
 type PlayInput struct {
-	SongID     string
-	Song       *store.Song
-	Queue      []store.Song
-	QueueIndex int
-	StartAt    time.Duration
+	SongID      string
+	Song        *store.Song
+	Queue       []store.Song
+	QueueIndex  int
+	StartAt     time.Duration
+	RandomStart bool
 }
 
 // Accepted 是会话已经接受的播放请求。RequestID 是控制器请求号，不是播放代次。

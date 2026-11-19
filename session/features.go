@@ -51,7 +51,11 @@ func feature[T any](f *Features, ctx context.Context, fn func(context.Context) (
 	defer cancel()
 	stop := context.AfterFunc(f.s.root, cancel)
 	defer stop()
-	return fn(local)
+	result, err := fn(local)
+	// API 响应可能轮换 MUSIC_U 一类的 Cookie；所有命令结束后顺手比对并
+	// 落盘，避免进程重启时把旧 token 当成登录态。
+	f.s.svc.PersistSessions()
+	return result, err
 }
 func (f *Features) Subscribe() (<-chan string, func()) {
 	f.mu.Lock()
@@ -481,6 +485,26 @@ func (f *Features) selection(ctx context.Context, in Selection) ([]store.Song, e
 	}
 	return out, nil
 }
+
+// mirrorCloudSong 把刚写入云端的歌补进已导入的本地镜像。
+// 平台歌单详情有缓存，只等下次刷新会让新歌迟迟不出现。
+func (f *Features) mirrorCloudSong(song store.Song, remoteID string) {
+	if f.s.store == nil || remoteID == "" || remoteID == "daily" {
+		return
+	}
+	lists, err := f.s.store.ListPlaylists()
+	if err != nil {
+		return
+	}
+	song = store.NormalizeSong(song)
+	for _, p := range lists {
+		if p.Kind != "remote" || p.Frozen || p.RemoteID != remoteID || p.Source != song.Source {
+			continue
+		}
+		_ = f.s.svc.AddSongToPlaylist(p.ID, song)
+	}
+}
+
 func (f *Features) Batch(ctx context.Context, action, target string, in Selection) (BatchResult, error) {
 	return feature(f, ctx, func(ctx context.Context) (BatchResult, error) {
 		out := BatchResult{Succeeded: []string{}, Skipped: []string{}, Failed: []BatchItem{}}
@@ -506,7 +530,13 @@ func (f *Features) Batch(ctx context.Context, action, target string, in Selectio
 					return out, ErrNotFound
 				}
 			}
-			_, err = f.s.Play(ctx, PlayInput{Queue: songs, QueueIndex: index})
+			// 目标就是歌单本身时按「播放全部」处理：随机模式下第一首也洗牌。
+			// 点某一首（target 是歌曲 ID）仍从那首开始。
+			_, err = f.s.Play(ctx, PlayInput{
+				Queue:       songs,
+				QueueIndex:  index,
+				RandomStart: in.PlaylistID != "" && target == in.PlaylistID,
+			})
 			if err == nil {
 				for _, song := range songs {
 					out.Succeeded = append(out.Succeeded, song.ID)
@@ -533,8 +563,8 @@ func (f *Features) Batch(ctx context.Context, action, target string, in Selectio
 						e = fmt.Errorf("只能添加同来源曲目")
 					} else if strings.HasPrefix(song.ExternalID(), "program:") {
 						e = fmt.Errorf("节目不能加入云端歌曲歌单")
-					} else {
-						e = f.s.svc.AddToCloudPlaylist(ctx, song, parts[1])
+					} else if e = f.s.svc.AddToCloudPlaylist(ctx, song, parts[1]); e == nil {
+						f.mirrorCloudSong(song, parts[1])
 					}
 					break
 				}
@@ -544,8 +574,8 @@ func (f *Features) Batch(ctx context.Context, action, target string, in Selectio
 				} else if p.Kind == "remote" {
 					if p.Source != song.Source {
 						e = fmt.Errorf("只能添加同来源曲目")
-					} else {
-						e = f.s.svc.AddToCloudPlaylist(ctx, song, p.RemoteID)
+					} else if e = f.s.svc.AddToCloudPlaylist(ctx, song, p.RemoteID); e == nil {
+						f.mirrorCloudSong(song, p.RemoteID)
 					}
 				} else {
 					e = f.s.svc.AddSongToPlaylist(target, song)

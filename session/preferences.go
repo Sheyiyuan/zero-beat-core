@@ -19,6 +19,7 @@ type GUISettings struct {
 	CloseAction string            `json:"close_action"`
 	Shortcuts   map[string]string `json:"shortcuts"`
 	Window      string            `json:"window"`
+	Haptics     bool              `json:"haptics"`
 }
 
 func (f *Features) Preferences(ctx context.Context) (app.Preferences, error) {
@@ -26,7 +27,7 @@ func (f *Features) Preferences(ctx context.Context) (app.Preferences, error) {
 }
 func (f *Features) GUISettings(ctx context.Context) (GUISettings, error) {
 	return feature(f, ctx, func(context.Context) (GUISettings, error) {
-		out := GUISettings{Theme: "system", Palette: "zero-red", CloseAction: "background", Shortcuts: map[string]string{}}
+		out := GUISettings{Theme: "system", Palette: "zero-red", CloseAction: "background", Shortcuts: map[string]string{}, Haptics: true}
 		_ = json.Unmarshal([]byte(f.s.store.Setting("gui.settings", "")), &out)
 		if out.Shortcuts == nil {
 			out.Shortcuts = map[string]string{}
@@ -175,14 +176,17 @@ func (f *Features) EditClip(ctx context.Context, id, action string, clip store.C
 					return err
 				}
 				s.clipPreviewSong = ""
+				s.clipPreviewClip = store.Clip{}
 				s.startPlay(song, time.Duration(clip.StartMS)*time.Millisecond, 0, s.intent)
 				f.changed("lyrics.changed")
 			case "preview":
 				s.clipPreviewSong = id
+				s.clipPreviewClip = clip
 				s.startPlay(song, time.Duration(max(0, at))*time.Millisecond, 0, s.intent)
 			case "cancel":
 				if s.clipPreviewSong == id {
 					s.clipPreviewSong = ""
+					s.clipPreviewClip = store.Clip{}
 					clip, err := s.svc.Clip(id)
 					if err != nil {
 						return err
