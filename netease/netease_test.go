@@ -60,7 +60,7 @@ func TestParseResolved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
-	if res.Stream.URL != "http://cdn.example/song.mp3" || res.Stream.Quality != "320k" || res.Stream.Codec != "mp3" {
+	if res.Stream.URL != "https://cdn.example/song.mp3" || res.Stream.Quality != "320k" || res.Stream.Codec != "mp3" {
 		t.Fatalf("流字段不符: %+v", res.Stream)
 	}
 	if time.Until(res.Stream.ExpiresAt) < 15*time.Minute {
@@ -175,6 +175,20 @@ func TestParsePlaylistTracksSupportsBothShapes(t *testing.T) {
 	if err != nil || len(tracks) != 1 || tracks[0].Duration != 223 || tracks[0].Artist != "歌手2" {
 		t.Fatalf("playlist.tracks 解析失败: %+v %v", tracks, err)
 	}
+	ordered := []byte(`{"code":200,"playlist":{
+		"tracks":[
+			{"id":1,"name":"A","dt":1000,"al":{"name":"x"}},
+			{"id":2,"name":"B","dt":1000,"al":{"name":"y"}}
+		],
+		"trackIds":[{"id":2},{"id":3},{"id":1}]
+	}}`)
+	parsed, err := parsePlaylistDetail(ordered)
+	if err != nil {
+		t.Fatalf("解析 trackIds 失败: %v", err)
+	}
+	if len(parsed.Order) != 3 || parsed.Order[0] != "2" || parsed.Order[1] != "3" || len(parsed.Missing) != 1 || parsed.Missing[0] != "3" {
+		t.Fatalf("应跟 trackIds 而不是缓存的 tracks: %+v", parsed)
+	}
 }
 
 func TestParseAccount(t *testing.T) {
@@ -217,6 +231,33 @@ func TestQualityMapping(t *testing.T) {
 	}
 	if qualityLabel("exhigh", 0) != "320k" || qualityLabel("lossless", 0) != "无损" {
 		t.Fatal("音质标签不符")
+	}
+}
+
+func TestReloadingSameSessionKeepsProfile(t *testing.T) {
+	c := New()
+	c.SetSession(map[string]string{"MUSIC_U": "token-1"})
+	c.setUser(source.User{ID: "42", Name: "云村用户", LoggedIn: true})
+
+	c.SetSession(map[string]string{"MUSIC_U": "token-1", "os": "ios"})
+	got := c.User()
+	if !got.LoggedIn || got.Name != "云村用户" || got.ID != "42" {
+		t.Fatalf("同一 MUSIC_U 回填后应保持已登录和昵称: %+v", got)
+	}
+
+	c.setUser(source.User{})
+	if got = c.User(); !got.LoggedIn || got.Name != "" {
+		t.Fatalf("昵称缓存为空时，有 MUSIC_U 仍应显示已登录: %+v", got)
+	}
+
+	c.SetSession(map[string]string{"MUSIC_U": "token-2"})
+	if got = c.User(); !got.LoggedIn || got.Name != "" {
+		t.Fatalf("换了 MUSIC_U 应丢掉旧昵称，但仍是已登录: %+v", got)
+	}
+
+	c.Logout()
+	if got = c.User(); got.LoggedIn || got.Name != "" {
+		t.Fatalf("退出后不应再显示已登录: %+v", got)
 	}
 }
 
@@ -275,8 +316,32 @@ func TestRefreshErrorClassifiesAuthCodes(t *testing.T) {
 }
 
 func TestNormalizeURL(t *testing.T) {
-	if normalizeURL("//p1/x.jpg") != "https://p1/x.jpg" || normalizeURL("http://p1/x.jpg") != "http://p1/x.jpg" {
+	if normalizeURL("//p1/x.jpg") != "https://p1/x.jpg" || normalizeURL("http://p1/x.jpg") != "https://p1/x.jpg" {
 		t.Fatal("URL 归一化不符")
+	}
+}
+
+func TestCoverURLUsesSmallHTTPSRendition(t *testing.T) {
+	got := coverURL("http://p2.music.126.net/abc==/1.jpg")
+	if got != "https://p2.music.126.net/abc==/1.jpg?param=640y640" {
+		t.Fatalf("封面应升到 HTTPS 小图，实际 %s", got)
+	}
+	if again := coverURL(got); again != got {
+		t.Fatalf("已带尺寸参数时不应重复追加: %s", again)
+	}
+}
+
+func TestDailyCoverFallsBackToPicStr(t *testing.T) {
+	body := []byte(`{"code":200,"data":{"dailySongs":[
+		{"id":101,"name":"日推","dt":180000,"ar":[{"name":"歌手"}],"al":{"name":"专辑","pic_str":"109951164366754363"}}
+	]}}`)
+	tracks, err := parseDailySongs(body)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	const want = "https://p1.music.126.net/2wqbcI0jhhalPlLbJnSZdA==/109951164366754363.jpg?param=640y640"
+	if len(tracks) != 1 || tracks[0].Cover != want {
+		t.Fatalf("缺少 picUrl 时应由 pic_str 补封面: %+v", tracks)
 	}
 }
 

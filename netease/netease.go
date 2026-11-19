@@ -7,7 +7,9 @@ package netease
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -192,10 +194,16 @@ func (c *Client) LoggedIn() bool {
 }
 
 // User 实现 source.Source。
+//
+// 是否登录只看 MUSIC_U 还在不在。昵称是另一次账号接口的缓存，
+// 同步回填或接口暂时失败都会让缓存变空，不能因此显示成登录失效。
 func (c *Client) User() source.User {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.user
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.syncCookiesLocked()
+	u := c.user
+	u.LoggedIn = c.cookies["MUSIC_U"] != ""
+	return u
 }
 
 func (c *Client) setUser(u source.User) {
@@ -208,20 +216,27 @@ func (c *Client) setUser(u source.User) {
 func (c *Client) Session() map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.jar != nil {
-		fresh := map[string]string{}
-		for _, ck := range c.jar.Cookies(musicURL) {
-			if ck.Name != "" && ck.Value != "" {
-				fresh[ck.Name] = ck.Value
-			}
-		}
-		c.cookies = fresh
-	}
+	c.syncCookiesLocked()
 	out := make(map[string]string, len(c.cookies))
 	for k, v := range c.cookies {
 		out[k] = v
 	}
 	return out
+}
+
+// syncCookiesLocked 用 jar 里当前还能发出去的 cookie 覆盖内存副本。
+// 调用方必须持有 c.mu。
+func (c *Client) syncCookiesLocked() {
+	if c.jar == nil {
+		return
+	}
+	fresh := map[string]string{}
+	for _, ck := range c.jar.Cookies(musicURL) {
+		if ck.Name != "" && ck.Value != "" {
+			fresh[ck.Name] = ck.Value
+		}
+	}
+	c.cookies = fresh
 }
 
 // SetSession 实现 source.Source。
@@ -244,12 +259,18 @@ func (c *Client) SetSession(cookies map[string]string) {
 	neautil.SetGlobalCookieJar(jar)
 
 	c.mu.Lock()
+	c.syncCookiesLocked()
+	previous := c.cookies["MUSIC_U"]
 	c.jar = jar
 	c.cookies = make(map[string]string, len(session))
 	for k, v := range session {
 		c.cookies[k] = v
 	}
-	c.user = source.User{}
+	// 同一份 MUSIC_U 被同步再次写入时，保留已经拉到的昵称。
+	// token 换了或退出登录才丢掉资料，避免用旧账号的 uid 去拉歌单。
+	if c.cookies["MUSIC_U"] == "" || c.cookies["MUSIC_U"] != previous {
+		c.user = source.User{}
+	}
 	c.mu.Unlock()
 }
 
@@ -341,7 +362,7 @@ func (c *Client) accountLocked(ctx context.Context) (source.User, error) {
 	svc := &neaservice.UserAccountService{}
 	code, body := svc.AccountInfo()
 	if code != 200 {
-		c.setUser(source.User{})
+		// 网络或风控失败时保留上次的昵称。cookie 还在，界面应继续显示已登录。
 		return source.User{}, apiError(int(code), "账号信息不可用", "nuser/account/get")
 	}
 	u, err := parseAccount(body)
@@ -350,7 +371,7 @@ func (c *Client) accountLocked(ctx context.Context) (source.User, error) {
 	}
 	if !u.LoggedIn {
 		// MUSIC_U 还在，但账号接口已经不认它了：这就是登录过期，而不是未登录。
-		c.setUser(source.User{})
+		// 资料留给调用方的退出流程清掉；这里清掉的话，续期成功前界面会闪成失效。
 		return source.User{}, fmt.Errorf("%w: %w", source.ErrSessionExpired,
 			&APIError{Code: int(code), Message: "账号信息为空", Path: "nuser/account/get"})
 	}
@@ -443,8 +464,10 @@ type neArtist struct {
 }
 
 type neAlbum struct {
-	Name   string `json:"name"`
-	PicURL string `json:"picUrl"`
+	Name       string `json:"name"`
+	PicURL     string `json:"picUrl"`
+	BlurPicURL string `json:"blurPicUrl"`
+	PicStr     string `json:"pic_str"`
 }
 
 type neSong struct {
@@ -474,10 +497,48 @@ func (s neSong) artist() string {
 }
 
 func (s neSong) album() neAlbum {
-	if s.Al.Name != "" || s.Al.PicURL != "" {
+	if s.Al.picture() != "" {
+		if s.Al.Name == "" {
+			s.Al.Name = s.Album.Name
+		}
+		return s.Al
+	}
+	if s.Album.picture() != "" {
+		if s.Album.Name == "" {
+			s.Album.Name = s.Al.Name
+		}
+		return s.Album
+	}
+	if s.Al.Name != "" {
 		return s.Al
 	}
 	return s.Album
+}
+
+func (a neAlbum) picture() string {
+	if u := strings.TrimSpace(a.PicURL); u != "" {
+		return u
+	}
+	if u := strings.TrimSpace(a.BlurPicURL); u != "" {
+		return u
+	}
+	// 每日推荐有时只给 pic_str，不给 picUrl。用网易云公开的封面算法补出地址。
+	if id := strings.TrimSpace(a.PicStr); id != "" {
+		return neteasePicURL(id)
+	}
+	return ""
+}
+
+func neteasePicURL(id string) string {
+	const magic = "3go8&$8*3*3h0k(2)2"
+	buf := []byte(id)
+	for i := range buf {
+		buf[i] ^= magic[i%len(magic)]
+	}
+	sum := md5.Sum(buf)
+	enc := base64.StdEncoding.EncodeToString(sum[:])
+	enc = strings.NewReplacer("/", "_", "+", "-").Replace(enc)
+	return "https://p1.music.126.net/" + enc + "/" + id + ".jpg"
 }
 
 func (s neSong) track() source.Track {
@@ -493,14 +554,35 @@ func (s neSong) track() source.Track {
 		Artist:     s.artist(),
 		Album:      s.album().Name,
 		Duration:   int((ms + 500) / 1000),
-		Cover:      normalizeURL(s.album().PicURL),
+		Cover:      coverURL(s.album().picture()),
 	}
+}
+
+// coverURL 把网易云封面收成 HTTPS 小图。原图经常有数兆，列表一次解码几十张时会刷不出来。
+func coverURL(raw string) string {
+	raw = normalizeURL(raw)
+	if raw == "" || strings.Contains(raw, "param=") {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !strings.HasSuffix(u.Host, "music.126.net") {
+		return raw
+	}
+	q := u.Query()
+	q.Set("param", "640y640")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func normalizeURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if strings.HasPrefix(raw, "//") {
 		return "https:" + raw
+	}
+	// Android blocks cleartext HTTP by default. NetEase's media and image
+	// CDNs serve the same paths over TLS, so keep every returned URL HTTPS.
+	if strings.HasPrefix(raw, "http://") {
+		return "https://" + strings.TrimPrefix(raw, "http://")
 	}
 	return raw
 }
@@ -653,20 +735,35 @@ func (c *Client) Track(ctx context.Context, ref source.Ref) (source.Track, error
 }
 
 func parseSongDetail(body []byte) (source.Track, error) {
+	tracks, err := parseSongDetails(body)
+	if err != nil {
+		return source.Track{}, err
+	}
+	if len(tracks) == 0 {
+		return source.Track{}, fmt.Errorf("netease: 歌曲不存在")
+	}
+	return tracks[0], nil
+}
+
+func parseSongDetails(body []byte) ([]source.Track, error) {
 	var data struct {
 		Code  int      `json:"code"`
 		Songs []neSong `json:"songs"`
 	}
 	if err := json.Unmarshal(body, &data); err != nil {
-		return source.Track{}, fmt.Errorf("netease: 解析歌曲信息: %w", err)
+		return nil, fmt.Errorf("netease: 解析歌曲信息: %w", err)
 	}
 	if data.Code != 0 && data.Code != 200 {
-		return source.Track{}, &APIError{Code: data.Code, Message: "歌曲信息不可用", Path: "song/detail"}
+		return nil, &APIError{Code: data.Code, Message: "歌曲信息不可用", Path: "song/detail"}
 	}
-	if len(data.Songs) == 0 {
-		return source.Track{}, fmt.Errorf("netease: 歌曲不存在")
+	out := make([]source.Track, 0, len(data.Songs))
+	for _, song := range data.Songs {
+		if song.ID == 0 {
+			continue
+		}
+		out = append(out, song.track())
 	}
-	return data.Songs[0].track(), nil
+	return out, nil
 }
 
 func levelFor(q source.Quality) neaservice.SongQualityLevel {
@@ -961,12 +1058,70 @@ func (c *Client) PlaylistTracks(ctx context.Context, remoteID string) ([]source.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	svc := &neaservice.PlaylistDetailService{Id: strconv.FormatInt(id, 10), S: "8"}
-	code, body := svc.PlaylistDetail()
+	// v3 歌单详情的 tracks 有服务端缓存，刚加入的歌要等缓存过期才出现。
+	// timestamp 用来绕过这份缓存；trackIds 比 tracks 更新，缺的曲目再补 song/detail。
+	code, body, _ := neautil.CreateRequest("POST", "https://music.163.com/api/v3/playlist/detail", map[string]string{
+		"id":        strconv.FormatInt(id, 10),
+		"n":         "100000",
+		"s":         "8",
+		"timestamp": strconv.FormatInt(time.Now().UnixMilli(), 10),
+	}, &neautil.Options{Crypto: "linuxapi"})
 	if code != 200 {
 		return nil, apiError(int(code), "歌单不可用", "playlist/detail")
 	}
-	return parsePlaylistTracks(body)
+	parsed, err := parsePlaylistDetail(body)
+	if err != nil {
+		return nil, err
+	}
+	if len(parsed.Missing) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		extra, ferr := c.songDetails(ctx, parsed.Missing)
+		if ferr != nil && len(parsed.Tracks) == 0 {
+			return nil, ferr
+		}
+		parsed.Tracks = append(parsed.Tracks, extra...)
+	}
+	if len(parsed.Order) == 0 {
+		return parsed.Tracks, nil
+	}
+	byID := make(map[string]source.Track, len(parsed.Tracks))
+	for _, track := range parsed.Tracks {
+		byID[track.ExternalID] = track
+	}
+	out := make([]source.Track, 0, len(parsed.Order))
+	for _, id := range parsed.Order {
+		if track, ok := byID[id]; ok {
+			out = append(out, track)
+		}
+	}
+	return out, nil
+}
+
+func (c *Client) songDetails(ctx context.Context, ids []string) ([]source.Track, error) {
+	const batch = 100
+	out := make([]source.Track, 0, len(ids))
+	for i := 0; i < len(ids); i += batch {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := i + batch
+		if end > len(ids) {
+			end = len(ids)
+		}
+		svc := &neaservice.SongDetailService{Ids: strings.Join(ids[i:end], ",")}
+		code, body := svc.SongDetail()
+		if code != 200 {
+			return out, apiError(int(code), "歌曲信息不可用", "song/detail")
+		}
+		part, err := parseSongDetails(body)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, part...)
+	}
+	return out, nil
 }
 
 // AddToPlaylist 实现 source.PlaylistWriter：把一首歌加入当前账号的网易云歌单。
@@ -1062,34 +1217,85 @@ func parsePlaylistWriteResponse(body []byte) error {
 	return nil
 }
 
+type parsedPlaylist struct {
+	Tracks  []source.Track
+	Order   []string
+	Missing []string
+}
+
 func parsePlaylistTracks(body []byte) ([]source.Track, error) {
+	parsed, err := parsePlaylistDetail(body)
+	if err != nil {
+		return nil, err
+	}
+	if len(parsed.Order) == 0 {
+		return parsed.Tracks, nil
+	}
+	byID := make(map[string]source.Track, len(parsed.Tracks))
+	for _, track := range parsed.Tracks {
+		byID[track.ExternalID] = track
+	}
+	out := make([]source.Track, 0, len(parsed.Order))
+	for _, id := range parsed.Order {
+		if track, ok := byID[id]; ok {
+			out = append(out, track)
+		}
+	}
+	return out, nil
+}
+
+func parsePlaylistDetail(body []byte) (parsedPlaylist, error) {
 	var data struct {
 		Code   int `json:"code"`
 		Result struct {
 			Tracks []neSong `json:"tracks"`
 		} `json:"result"`
 		Playlist struct {
-			Tracks []neSong `json:"tracks"`
+			Tracks   []neSong `json:"tracks"`
+			TrackIDs []struct {
+				ID int64 `json:"id"`
+			} `json:"trackIds"`
 		} `json:"playlist"`
 	}
 	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, fmt.Errorf("netease: 解析歌单详情: %w", err)
+		return parsedPlaylist{}, fmt.Errorf("netease: 解析歌单详情: %w", err)
 	}
 	if data.Code != 0 && data.Code != 200 {
-		return nil, apiError(data.Code, "歌单不可用", "playlist/detail")
+		return parsedPlaylist{}, apiError(data.Code, "歌单不可用", "playlist/detail")
 	}
 	raw := data.Result.Tracks
 	if len(raw) == 0 {
 		raw = data.Playlist.Tracks // v3 /playlist/detail 把 tracks 放在 playlist 下
 	}
-	out := make([]source.Track, 0, len(raw))
-	for _, s := range raw {
-		if s.ID == 0 {
+	tracks := make([]source.Track, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	for _, song := range raw {
+		if song.ID == 0 {
 			continue
 		}
-		out = append(out, s.track())
+		track := song.track()
+		if seen[track.ExternalID] {
+			continue
+		}
+		seen[track.ExternalID] = true
+		tracks = append(tracks, track)
 	}
-	return out, nil
+	if len(data.Playlist.TrackIDs) == 0 {
+		return parsedPlaylist{Tracks: tracks}, nil
+	}
+	order := make([]string, 0, len(data.Playlist.TrackIDs))
+	var missing []string
+	for _, item := range data.Playlist.TrackIDs {
+		if item.ID == 0 {
+			continue
+		}
+		id := strconv.FormatInt(item.ID, 10)
+		order = append(order, id)
+		if !seen[id] {
+			missing = append(missing, id)
+		}
+	}
+	return parsedPlaylist{Tracks: tracks, Order: order, Missing: missing}, nil
 }
 
 func parseAccount(body []byte) (source.User, error) {
