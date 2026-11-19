@@ -61,6 +61,14 @@ const (
 	CommandSetVolume
 	CommandSetShuffle
 	CommandSetLoopStatus
+	// CommandRestart 从头播放当前曲目，但保持播放/暂停状态不变。
+	// MPRIS 没有独立的 Restart 标准方法，由厂商接口 Control.Restart 发出；
+	// 标准客户端仍可用 SetPosition(trackId, 0) 达到同样效果。
+	CommandRestart
+	// CommandCycleMode 按 GUI 播放栏的顺序循环切换播放模式。
+	// MPRIS 的 LoopStatus/Shuffle 是两个独立属性，无法表达“一键循环”，
+	// 因此由厂商接口 Control.CyclePlaybackMode 发出。
+	CommandCycleMode
 )
 
 // Command 是系统面板发来的操作。

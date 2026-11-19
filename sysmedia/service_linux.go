@@ -25,6 +25,12 @@ const (
 	mprisPlayerIface = "org.mpris.MediaPlayer2.Player"
 	propsIface       = "org.freedesktop.DBus.Properties"
 
+	// MPRIS 的 Player 接口没有“从头播放”和“循环切换模式”两个动作：
+	// LoopStatus / Shuffle 是分开的可写属性。厂商扩展接口提供单次调用，
+	// 不污染标准接口；标准客户端仍可继续用 SetPosition(trackId, 0)、
+	// LoopStatus 和 Shuffle。
+	mprisControlIface = "org.zero_beat.MediaPlayer2.Control"
+
 	noTrack = dbus.ObjectPath("/org/mpris/MediaPlayer2/TrackList/NoTrack")
 )
 
@@ -82,6 +88,7 @@ func (s *linuxService) export() error {
 		// D-Bus 侧的方法名必须是 Seek，但 Go 方法不能叫 Seek：
 		// 那会冒充 io.Seeker，go vet 的 stdmethods 会报签名不匹配。
 		{mprisPlayerIface, &player{s}, map[string]string{"SeekOffset": "Seek"}},
+		{mprisControlIface, &control{s}, nil},
 		{propsIface, &props{s}, nil},
 	}
 	for _, e := range exports {
@@ -151,6 +158,10 @@ func mprisIntrospection() *introspect.Node {
 				Signals: []introspect.Signal{
 					{Name: "Seeked", Args: []introspect.Arg{{Name: "Position", Type: "x", Direction: "out"}}},
 				},
+			},
+			{
+				Name:    mprisControlIface,
+				Methods: introspect.Methods(&control{}),
 			},
 			{
 				Name:    propsIface,
@@ -444,6 +455,23 @@ func (p *props) Set(iface string, name string, value dbus.Variant) *dbus.Error {
 }
 
 type player struct{ s *linuxService }
+
+// control 是厂商扩展接口。方法名与 MPRIS 标准接口分开，避免第三方客户端
+// 把非标准方法误当成标准能力；能显示标准循环按钮的面板继续使用
+// LoopStatus / Shuffle，不依赖这里。
+type control struct{ s *linuxService }
+
+// Restart 从头播放当前曲目；播放状态交给播放器保持不变。
+func (c *control) Restart() *dbus.Error {
+	c.s.enqueue(Command{Kind: CommandRestart})
+	return nil
+}
+
+// CyclePlaybackMode 按列表循环 → 单曲循环 → 随机 → 顺序循环切换。
+func (c *control) CyclePlaybackMode() *dbus.Error {
+	c.s.enqueue(Command{Kind: CommandCycleMode})
+	return nil
+}
 
 func (p *player) Next() *dbus.Error {
 	p.s.enqueue(Command{Kind: CommandNext})

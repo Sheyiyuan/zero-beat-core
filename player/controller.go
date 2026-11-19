@@ -33,6 +33,23 @@ func (m Mode) String() string {
 	}
 }
 
+// Next 返回界面上“播放模式”按钮循环到的下一个模式。
+// 顺序必须与 GUI 播放栏一致：列表循环 → 单曲循环 → 随机 → 顺序 → 列表循环。
+// 系统媒体面板没有“循环模式”这一个标准动作，Android/MPRIS 的切换动作共用这里，
+// 避免两端各写一份顺序后逐渐不一致。
+func (m Mode) Next() Mode {
+	switch m {
+	case ModeListLoop:
+		return ModeLoopOne
+	case ModeLoopOne:
+		return ModeShuffle
+	case ModeShuffle:
+		return ModeOrdered
+	default:
+		return ModeListLoop
+	}
+}
+
 // QueueSaver 持久化队列；由 app.Service 实现。
 type QueueSaver interface {
 	SaveQueue(songs []store.Song, index int, positionMS int64) error

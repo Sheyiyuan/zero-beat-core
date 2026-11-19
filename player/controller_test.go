@@ -104,6 +104,20 @@ func TestControllerQueueAndMode(t *testing.T) {
 	}
 }
 
+// TestModeNextCyclesLikeGUI 锁定系统媒体面板的模式切换顺序与播放栏一致。
+func TestModeNextCyclesLikeGUI(t *testing.T) {
+	order := []Mode{ModeListLoop, ModeLoopOne, ModeShuffle, ModeOrdered}
+	for i, mode := range order {
+		if got, want := mode.Next(), order[(i+1)%len(order)]; got != want {
+			t.Fatalf("%v.Next() = %v，期望 %v", mode, got, want)
+		}
+	}
+	// 未知值（例如旧配置损坏）回到列表循环，不能停在无效状态。
+	if got := Mode(99).Next(); got != ModeListLoop {
+		t.Fatalf("未知模式 Next() = %v，期望 %v", got, ModeListLoop)
+	}
+}
+
 // TestControllerOrderedModeStopsAtQueueEnd 验证顺序模式播完即停：队尾不再回绕，
 // 队首不再回绕到末尾。
 func TestControllerOrderedModeStopsAtQueueEnd(t *testing.T) {

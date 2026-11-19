@@ -89,6 +89,9 @@ func TestMPRISExportsStateAndCommands(t *testing.T) {
 	if want := mprisPlayerIface; !strings.Contains(introspected, want) {
 		t.Fatalf("内省结果缺少 %q", want)
 	}
+	if want := mprisControlIface; !strings.Contains(introspected, want) {
+		t.Fatalf("内省结果缺少厂商接口 %q", want)
+	}
 
 	if err := obj.Call(mprisPlayerIface+".PlayPause", 0).Err; err != nil {
 		t.Fatalf("PlayPause: %v", err)
@@ -134,6 +137,64 @@ func TestMPRISExportsStateAndCommands(t *testing.T) {
 	}
 	if err := obj.Call(propsIface+".Set", 0, mprisPlayerIface, "LoopStatus", dbus.MakeVariant("loop")).Err; err == nil {
 		t.Fatal("非法 LoopStatus 值应被拒绝")
+	}
+
+	for _, call := range []struct {
+		method string
+		want   CommandKind
+	}{
+		{mprisControlIface + ".Restart", CommandRestart},
+		{mprisControlIface + ".CyclePlaybackMode", CommandCycleMode},
+	} {
+		if err := obj.Call(call.method, 0).Err; err != nil {
+			t.Fatalf("%s: %v", call.method, err)
+		}
+		select {
+		case cmd := <-svc.Commands():
+			if cmd.Kind != call.want {
+				t.Fatalf("%s 命令 = %+v，期望 kind=%v", call.method, cmd, call.want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s 没有收到命令", call.method)
+		}
+	}
+}
+
+func TestControlMethodsEnqueueRestartAndCycle(t *testing.T) {
+	s := &linuxService{commands: make(chan Command, 8)}
+	c := &control{s: s}
+	if err := c.Restart(); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if err := c.CyclePlaybackMode(); err != nil {
+		t.Fatalf("CyclePlaybackMode: %v", err)
+	}
+	for _, want := range []CommandKind{CommandRestart, CommandCycleMode} {
+		select {
+		case got := <-s.commands:
+			if got.Kind != want {
+				t.Fatalf("命令 = %+v，期望 kind=%v", got, want)
+			}
+		default:
+			t.Fatalf("缺少 kind=%v 的命令", want)
+		}
+	}
+}
+
+func TestIntrospectionExportsVendorControlInterface(t *testing.T) {
+	var methods []string
+	for _, iface := range mprisIntrospection().Interfaces {
+		if iface.Name != mprisControlIface {
+			continue
+		}
+		for _, method := range iface.Methods {
+			methods = append(methods, method.Name)
+		}
+	}
+	for _, want := range []string{"Restart", "CyclePlaybackMode"} {
+		if !slices.Contains(methods, want) {
+			t.Fatalf("内省缺少 %s.%s，实际 %v", mprisControlIface, want, methods)
+		}
 	}
 }
 
